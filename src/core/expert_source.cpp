@@ -23,6 +23,7 @@
 #include "strata/kernels/cpu/kq_avx1.hpp"
 #include "strata/kernels/cpu/kq_avx2.hpp"
 #include "strata/kernels/cpu/pool.hpp"
+#include "ggml.h"  // Sprint 5: ggml to_float for the resident-quant sidecar build (startup only)
 
 #include <cuda_runtime.h>
 #ifndef _WIN32
@@ -1608,6 +1609,9 @@ void FileExpertSource::close() {
     complement_pin_limit_ = 0;
     complement_lock_off_ = 0;
     complement_ready_ = false;
+    resident_quant_ready_ = false;
+    resident_quant_data_.clear();
+    resident_quant_offsets_.clear();
     complement_locked_ = 0;
     complement_lent_slots_ = 0;
     if (!maps_.empty()) {
@@ -4263,6 +4267,10 @@ bool FileExpertSource::pin_cache_complement(
     complement_lent_slots_ = lend ? n_slots - keep_from : budget_lent;   // a budget keeps its own tail of the region
     complement_lent_slots_ += stage_lent;   // and the split stages' regions: pairs the copy kept of them
     complement_ready_ = true;
+    if (resident_quant_mode_ != ResidentQuant::Off && !build_resident_quant_complement())
+        std::fprintf(stderr, "FileExpertSource: --resident-quant %s unavailable for this pack/layout or CPU; "
+                             "the resident complement stays in its original format\n",
+                     resident_quant_name(resident_quant_mode_));
     std::fprintf(stderr, "FileExpertSource: %s cache complement ready: resident %.2f GiB, pinned %.2f GiB in %.0f s%s%s\n",
                  complement_pinned_ ? "mapped pinned" : pin ? "locked resident" : "pageable resident",
                  (double) resident_bytes() / 1073741824.0, (double) pinned_bytes() / 1073741824.0,
@@ -4301,6 +4309,97 @@ bool FileExpertSource::pin_cache_complement(
     }
     std::fflush(stderr);
     return true;
+}
+
+bool FileExpertSource::build_resident_quant_complement() {
+#if !defined(STRATA_CPU_MOE_AVX2)
+    return false;
+#else
+    resident_quant_ready_ = false;
+    resident_quant_data_.clear();
+    resident_quant_offsets_.clear();
+    if (resident_quant_mode_ == ResidentQuant::Off || complement_host_ == nullptr ||
+        !strata::kernels::cpu::cpu_avx2_ok()) return false;
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    if (!lay.native || lay.fmt.size() != size_t(n_layers_)) return false;
+
+    resident_quant_offsets_.assign(size_t(std::max<int64_t>(0, blobs_)), kNoComplement);
+    std::vector<float> row(size_t(std::max(strata::kernels::cpu::H, strata::kernels::cpu::FF)));
+    for (int64_t layer = 0; layer < n_layers_; ++layer) {
+        const auto& fmt = lay.fmt[size_t(layer)];
+        if (fmt.n_embd <= 0 || fmt.n_ff <= 0 || fmt.n_embd > strata::kernels::cpu::H ||
+            fmt.n_ff > strata::kernels::cpu::FF || fmt.n_embd % 32 != 0 || fmt.n_ff % 32 != 0 ||
+            fmt.tail_off != 0 || fmt.had_block != 0 || fmt.gu_signs != nullptr || fmt.d_signs != nullptr)
+            return false;
+        const auto* gu_traits = ggml_get_type_traits(ggml_type(fmt.gu_type));
+        const auto* d_traits = ggml_get_type_traits(ggml_type(fmt.d_type));
+        if (gu_traits == nullptr || d_traits == nullptr || gu_traits->to_float == nullptr || d_traits->to_float == nullptr)
+            return false;
+        const size_t gu_qrow = resident_quant_row_bytes(int(fmt.n_embd), resident_quant_mode_);
+        const size_t d_qrow = resident_quant_row_bytes(int(fmt.n_ff), resident_quant_mode_);
+        const size_t up_qoff = gu_qrow * size_t(fmt.n_ff);
+        const size_t down_qoff = 2 * up_qoff;
+        const size_t blob_qbytes = down_qoff + d_qrow * size_t(fmt.n_embd);
+        for (int64_t expert = 0; expert < n_expert_; ++expert) {
+            const size_t index = size_t(layer) * size_t(n_expert_) + size_t(expert);
+            if (index >= complement_offsets_.size() || complement_offsets_[index] == kNoComplement) continue;
+            const uint8_t* blob = complement_host_ + size_t(complement_offsets_[index]);
+            const size_t dst_off = resident_quant_data_.size();
+            resident_quant_data_.resize(dst_off + blob_qbytes);
+            uint8_t* dst = resident_quant_data_.data() + dst_off;
+            auto convert = [&](const uint8_t* src, int rows, int cols, size_t src_row,
+                               const ggml_type_traits* traits, uint8_t* out, size_t qrow) {
+                for (int r = 0; r < rows; ++r) {
+                    traits->to_float(src + size_t(r) * src_row, row.data(), int64_t(cols));
+                    if (!resident_quantize_rows(resident_quant_mode_, row.data(), 1, cols,
+                                                 out + size_t(r) * qrow)) return false;
+                }
+                return true;
+            };
+            if (!convert(blob, int(fmt.n_ff), int(fmt.n_embd), fmt.gu_row, gu_traits, dst, gu_qrow) ||
+                !convert(blob + fmt.up_off, int(fmt.n_ff), int(fmt.n_embd), fmt.gu_row, gu_traits,
+                         dst + up_qoff, gu_qrow) ||
+                !convert(blob + fmt.down_off, int(fmt.n_embd), int(fmt.n_ff), fmt.d_row, d_traits,
+                         dst + down_qoff, d_qrow)) {
+                resident_quant_data_.clear();
+                resident_quant_offsets_.clear();
+                return false;
+            }
+            resident_quant_offsets_[index] = dst_off;
+        }
+    }
+    resident_quant_ready_ = !resident_quant_data_.empty();
+    if (resident_quant_ready_)
+        std::fprintf(stderr, "FileExpertSource: resident-quant %s sidecar: %.2f GiB for the resident complement "
+                             "(original %.2f GiB); CPU misses use the AVX2 fused dequant GEMV\n",
+                     resident_quant_name(resident_quant_mode_),
+                     double(resident_quant_data_.size()) / 1073741824.0,
+                     double(complement_bytes_) / 1073741824.0);
+    return resident_quant_ready_;
+#endif
+}
+
+int FileExpertSource::resident_quant_blob(int64_t layer, int64_t expert,
+                                          const strata::kernels::cpu::NativeFmt& in,
+                                          strata::kernels::cpu::NativeFmt& out,
+                                          const uint8_t** blob) const {
+    if (!resident_quant_ready_ || blob == nullptr || layer < 0 || expert < 0 ||
+        layer >= n_layers_ || expert >= n_expert_) return 0;
+    const size_t index = size_t(layer) * size_t(n_expert_) + size_t(expert);
+    if (index >= resident_quant_offsets_.size() || resident_quant_offsets_[index] == kNoComplement) return 0;
+    out = in;
+    out.gu_type = resident_quant_mode_ == ResidentQuant::Iq4Nl ? int(GGML_TYPE_IQ4_NL) : int(GGML_TYPE_Q4_0);
+    out.d_type = out.gu_type;
+    out.gu_act = int(GGML_TYPE_Q8_0);
+    out.d_act = int(GGML_TYPE_Q8_0);
+    out.gu_row = resident_quant_row_bytes(int(in.n_embd), resident_quant_mode_);
+    out.d_row = resident_quant_row_bytes(int(in.n_ff), resident_quant_mode_);
+    out.up_off = out.gu_row * size_t(in.n_ff);
+    out.down_off = 2 * out.up_off;
+    out.bytes = out.down_off + out.d_row * size_t(in.n_embd);
+    out.resident_quant = int(resident_quant_mode_);
+    *blob = resident_quant_data_.data() + size_t(resident_quant_offsets_[index]);
+    return int(resident_quant_mode_);
 }
 
 const uint8_t* FileExpertSource::resident_blob(size_t index) const {
@@ -5045,8 +5144,12 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 ++d.tail_experts;
             }
         }
-        // STRATA_PCIE_BALANCE (opt-in, #1548): the count comes from the measured CPU and GPU costs instead of the share
-        const bool pcie_ok = (d.pcie_num > 0 || d.pcie_model.on) && d.src->pcie_layer(d.layers);
+        // Sprint 1 (--pcie-frac 0): every host-resident miss stays on the CPU pool.  In particular, an
+        // already-fitted pcie_model (or a paused per-request model) must not reopen the PCIe lane after the
+        // caller explicitly selected CPU-only MoE compute.  Automatic tuning never starts at zero, so its
+        // behaviour is unchanged; zero is the explicit CPU-only value.
+        const bool cpu_moe_compute = d.pcie_num == 0;
+        const bool pcie_ok = !cpu_moe_compute && d.src->pcie_layer(d.layers);
         int m = pcie_ok ? d.pcie_model.pick(nmiss, (nmiss * d.pcie_num) >> 8) : 0;
         // STRATA_PCIE_MIN1 (opt-in): the share rounds to 0 for 1-2 misses per layer, so the PCIe lane idles on the typical
         // decode step; with >= 2 misses give it at least one (the last in routing order).  It only flies if its blob is
@@ -5080,8 +5183,11 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 } else if (d.fs != nullptr && d.fs->take(d.layers, e, ptr)) {
                     kd = 0;                        // Foresight: a landed swap-space slot holds it - a GPU group like a hit
                 } else {
-                    if (d.fs != nullptr) d.fs->note_miss(d.src, d.layers, e);
-                    if (miss_rank >= nmiss - m && fetches < P.staging_cap && fetches < 64) {
+                    // No weight blob is resolved for DMA in CPU-only mode: kd remains -1 and the job below
+                    // reads the resident blob in ExpertPool's workers.  The GPU plan was already published,
+                    // so its VRAM groups execute beside that CPU work.  Foresight copies are disabled too.
+                    if (!cpu_moe_compute && d.fs != nullptr) d.fs->note_miss(d.src, d.layers, e);
+                    if (!cpu_moe_compute && miss_rank >= nmiss - m && fetches < P.staging_cap && fetches < 64) {
                         const uint8_t* src = d.src->pinned(d.layers, e) ? d.src->blob(d.layers, e) : nullptr;
                         if (src != nullptr) {
                             kd = 1;
@@ -5129,7 +5235,9 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         pt("publish", fetches);
         if (P.publish) P.publish(P.ctx);
         pt("fetch", fetches);
-        if (P.fetch) P.fetch(P.ctx, dma_src, P.pcie_mode != 0 ? 0 : fetches, (size_t) bb);   // the copy engine, beside the CPU's work
+        // cpu_moe_compute implies fetches == 0. Keep the callback: fetch_dma's n==0 arm raises flag B without
+        // issuing any DMA; skipping it would leave the GPU waiting for a completion event that never comes.
+        if (P.fetch) P.fetch(P.ctx, dma_src, P.pcie_mode != 0 ? 0 : fetches, (size_t) bb);   // beside the CPU's work
     } else {
         for (int64_t i = 0; i < n; ++i) {
             const int32_t e = ids[i];
@@ -5300,6 +5408,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 nj.blob = d.jobs_multi[(size_t) prev].blob;
                 nj.expert_id = (int) e;
                 nj.fmt = d.jobs_multi[(size_t) prev].fmt;
+                nj.resident_quant = d.jobs_multi[(size_t) prev].resident_quant;
                 nj.nt = 0;
             }
             ExpertJobMulti& jb = d.jobs_multi[(size_t) jo];

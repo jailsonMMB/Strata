@@ -731,6 +731,10 @@ struct Options {
     /// not hold that the expert profile ranks hottest are copied into RAM, the rest are read from the files in place
     /// (the GGUF shards when the pack has no experts.bin).  0 = the whole complement (--resident-experts).
     uint64_t resident_budget = 0;
+    std::string resident_quant = "off";  // Sprint 5: off | iq4_nl | q4_0
+    strata::core::ResidentQuant resident_quant_mode = strata::core::ResidentQuant::Off;
+    int batch_slots = 1;                 // Sprint 5: cooperative slot scheduler cap (maps to --batch when >1)
+    bool batch_slots_given = false;
     /// R4: slots of VRAM-resident experts.  **0 = off, and off is the default.**
     /// **THE COMMENT THAT USED TO BE HERE WAS FALSE AND ROUND 328 MEASURED IT.**  It said "the cache has no
     /// consumer yet - `moe_hit_grouped_s2` does not exist - so switching it on costs the fill traffic and
@@ -968,8 +972,6 @@ struct Options {
     int radix_cache = -1;          // --radix-cache: resolved to serve=1, generate=0
     int spec_hybrid = 0;           // --spec-hybrid: opt-in deterministic MTP + dynamic n-gram
     int spec_ngram_window = 3;     // --spec-ngram-window: 2..4
-    int batch_slots = 1;           // Sprint 5: cooperative slot scheduler cap (maps to --batch when >1)
-    bool batch_slots_given = false;
     /// The MTP's own window cap (0 = --spec): with --spec 6 --mtp-max-t 4 the long windows come from suffix matches.
     int mtp_max_t = 0;
     /// --lookup-chain K (opt-in, 0 = off): prompt lookup CHAINED after the MTP's proposal.  The suffix drafter matches
@@ -1290,6 +1292,8 @@ void usage() {
                  "  --resident-cpu-experts  with mmap and a static profile, keep the experts the GPU cache does not\n"
                  "                       hold resident in ordinary RAM (and the prompt path's lend region as far as\n"
                  "                       RAM allows); adaptive swaps exchange them, so none is read from the file again.\n"
+                  "  --resident-quant off|iq4_nl|q4_0  Sprint 5: quantized host resident sidecar + AVX2 fused GEMV (default off)\n"
+                 "  --batch-slots N      Sprint 5: cooperative decode slots 1..8 (default 1; >1 maps to --batch)\n"
                  "  --resident-experts   the low-RAM PC's resident mode (setup): --mmap-experts --resident-cpu-experts\n"
                  "                       with the copy page-locked when possible, 4 GiB headroom, plain mmap if it\n"
                  "                       does not fit.  Same answers as --mmap-experts for the same placement.\n"
@@ -3561,7 +3565,6 @@ int main(int argc, char** argv) {
         else if (a == "--radix-cache") o.radix_cache = std::clamp(std::atoi(next("--radix-cache")), 0, 1);
         else if (a == "--spec-hybrid") o.spec_hybrid = std::clamp(std::atoi(next("--spec-hybrid")), 0, 1);
         else if (a == "--spec-ngram-window") o.spec_ngram_window = std::clamp(std::atoi(next("--spec-ngram-window")), 2, 4);
-        else if (a == "--batch-slots") { o.batch_slots = std::atoi(next("--batch-slots")); o.batch_slots_given = true; }
         else if (a == "--mtp-max-t") o.mtp_max_t = std::max(0, std::atoi(next("--mtp-max-t")));
         else if (a == "--lookup-max-t") o.lookup_max_t = std::max(0, std::atoi(next("--lookup-max-t")));
         else if (a == "--lookup-sizes") o.lookup_sizes = next("--lookup-sizes");
@@ -3659,6 +3662,8 @@ int main(int argc, char** argv) {
         else if (a == "--mmap-experts") o.mmap_experts = true;
         else if (a == "--shared-expert-arena") o.shared_expert_arena = next("--shared-expert-arena");
         else if (a == "--resident-cpu-experts") o.resident_cpu_experts = o.resident_cpu_explicit = true;
+        else if (a == "--resident-quant") o.resident_quant = next("--resident-quant");
+        else if (a == "--batch-slots") { o.batch_slots = std::atoi(next("--batch-slots")); o.batch_slots_given = true; }
         else if (a == "--resident-experts") {
             o.mmap_experts = o.resident_cpu_experts = o.resident_pin = o.resident_soft = true;
             o.resident_headroom = 4ull << 30;
@@ -3985,6 +3990,14 @@ int main(int argc, char** argv) {
     if (o.resident_cpu_experts && (!o.mmap_experts || o.expert_profile.empty())) {
         std::fprintf(stderr, "strata generate: --resident-cpu-experts requires --mmap-experts and a static --expert-profile\n");
         return 2;
+    }
+    {
+        strata::core::ResidentQuant rq;
+        if (!strata::core::parse_resident_quant(o.resident_quant.c_str(), rq)) {
+            std::fprintf(stderr, "strata generate: --resident-quant must be off, iq4_nl or q4_0\n");
+            return 2;
+        }
+        o.resident_quant_mode = rq;
     }
     if (o.batch_slots < 1 || o.batch_slots > 8) {
         std::fprintf(stderr, "strata generate: --batch-slots must be in [1,8]\n");
@@ -9937,6 +9950,7 @@ int main(int argc, char** argv) {
             src.set_extra_drop_files(std::move(drop));
         }
         const std::vector<std::pair<int32_t, int32_t>>& rank_all = profile_all.empty() ? profile : profile_all;
+        src.set_resident_quant(o.resident_quant_mode);
         bool resident_ok = src.pin_cache_complement(xcache, err, o.resident_pin, stage_pairs, lend_from,
                                                     o.resident_headroom, o.resident_budget, &rank_all);
         std::string whole_err;

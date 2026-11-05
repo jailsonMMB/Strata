@@ -205,6 +205,9 @@ if(STRATA_BUILD_CONVERSATION_TESTS)
   add_test(NAME session_save_reclaim_test COMMAND session_save_reclaim_test)
 endif()
 
+option(STRATA_CPU_MOE_AVX2 "Build the C99 AVX2/FMA IQ2_XS host MoE GEMV" ON)
+option(STRATA_CPU_MOE_ZNVER2 "Tune the host MoE GEMV specifically for AMD Zen 2 (-march=znver2)" OFF)
+
 if(STRATA_BUILD_TESTS)
   enable_testing()
   add_executable(radix_cache_test src/core/radix_cache.cpp tests/core/radix_cache_test.cpp)
@@ -218,6 +221,14 @@ if(STRATA_BUILD_TESTS)
   target_include_directories(batch_scheduler_test PRIVATE src/core)
   target_link_libraries(batch_scheduler_test PRIVATE Threads::Threads)
   add_test(NAME batch_scheduler_test COMMAND batch_scheduler_test)
+  if(STRATA_CPU_X86 AND NOT MSVC AND STRATA_CPU_MOE_AVX2)
+    add_executable(resident_quant_test src/core/resident_quant.cpp tests/core/resident_quant_test.cpp src/kernels/cpu_kernels_avx2.c)
+    target_compile_features(resident_quant_test PRIVATE cxx_std_17)
+    target_include_directories(resident_quant_test PRIVATE include third_party/ggml src/core)
+    set_source_files_properties(src/kernels/cpu_kernels_avx2.c PROPERTIES C_STANDARD 99 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF
+                                COMPILE_OPTIONS "-O3;-mavx2;-mfma;-mf16c")
+    add_test(NAME resident_quant_test COMMAND resident_quant_test)
+  endif()
 endif()
 
 if(STRATA_HIP_GFX906)
@@ -736,7 +747,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp src/core/dflash2.cpp
     src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp
     src/core/arch_defaults.cpp src/core/nv_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp
-    src/core/radix_cache.cpp src/core/spec_hybrid.cpp src/core/batch_scheduler.cpp)
+    src/core/radix_cache.cpp src/core/spec_hybrid.cpp src/core/batch_scheduler.cpp src/core/resident_quant.cpp)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
   if(_strata_uring_sources)

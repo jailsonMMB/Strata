@@ -26,6 +26,7 @@
 #include "strata/core/exchange_storage.hpp"
 #include "strata/core/hit_hook.hpp"
 #include "strata/kernels/cpu/pool.hpp"
+#include "../../../src/core/resident_quant.h"
 
 #include <algorithm>
 #include <array>
@@ -196,6 +197,15 @@ public:
     /// immediately and nothing is retained.  A CACHING source must return pointers into the cache, not into a
     /// reused staging buffer - otherwise the pool would read the next expert's bytes while computing this one.
     virtual const uint8_t* blob(int64_t layer, int64_t expert) = 0;
+    // Sprint 5: quantized resident sidecar. Returns 0, or 1 (IQ4_NL) / 2 (Q4_0), with
+    // `out` rewritten to the sidecar's row geometry and `blob` pointing at its gate rows.
+    virtual int resident_quant_blob(int64_t layer, int64_t expert,
+                                    const strata::kernels::cpu::NativeFmt& in,
+                                    strata::kernels::cpu::NativeFmt& out,
+                                    const uint8_t** blob) const {
+        (void) layer; (void) expert; (void) in; (void) out; (void) blob;
+        return 0;
+    }
     /// A blob pointer that stays valid (not recycled) for as long as the source is open: for a copy that runs
     /// asynchronously long after the call (the adaptive tier's swap-ins).  Defaults to `blob`.
     virtual const uint8_t* blob_stable(int64_t layer, int64_t expert) { return blob(layer, expert); }
@@ -767,6 +777,14 @@ public:
     void stage_lend_regions(std::vector<std::vector<std::pair<int32_t, int32_t>>> regions) {
         stage_lend_regions_ = std::move(regions);
     }
+    void set_resident_quant(ResidentQuant mode) { resident_quant_mode_ = mode; }
+    ResidentQuant resident_quant() const { return resident_quant_mode_; }
+    bool resident_quant_ready() const { return resident_quant_ready_; }
+    uint64_t resident_quant_bytes() const { return resident_quant_data_.size(); }
+    int resident_quant_blob(int64_t layer, int64_t expert,
+                            const strata::kernels::cpu::NativeFmt& in,
+                            strata::kernels::cpu::NativeFmt& out,
+                            const uint8_t** blob) const override;
     void close();
 
     bool mapped() const { return base_ != nullptr; }
@@ -1214,6 +1232,11 @@ private:
     uint64_t complement_pin_limit_ = 0;
     uint64_t complement_lock_off_ = 0;        ///< the working-set lock covers [lock_off, lock_off + locked)
     bool complement_ready_ = false;
+    ResidentQuant resident_quant_mode_ = ResidentQuant::Off;
+    std::vector<uint8_t> resident_quant_data_;
+    std::vector<uint64_t> resident_quant_offsets_;
+    bool resident_quant_ready_ = false;
+    bool build_resident_quant_complement();
     uint64_t complement_locked_ = 0;          ///< bytes held in the working set (pin refused)
     int64_t complement_lent_slots_ = 0;
     std::vector<std::vector<std::pair<int32_t, int32_t>>> stage_lend_regions_;  ///< a split: each stage's lend region
