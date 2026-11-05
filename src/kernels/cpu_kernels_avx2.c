@@ -417,3 +417,22 @@ void moe_gemv_q4_0_avx2(const void* restrict weights, const float* restrict x,
     strata_gemv_q4(weights, x, y, rows, cols, strata_q4_0_values);
     _mm256_zeroupper();
 }
+
+void strata_stream_write_ps(float* restrict dst,
+                            const float* restrict src,
+                            int count) {
+    int i = 0;
+    /* Align dst to 32-byte boundary before using streaming stores */
+    while (((uintptr_t) (dst + i) & 31) != 0 && i < count) {
+        dst[i] = src[i];
+        ++i;
+    }
+    for (; i + 8 <= count; i += 8) {
+        __m256 v = _mm256_loadu_ps(src + i);
+        _mm256_stream_ps(dst + i, v);
+    }
+    for (; i < count; ++i) {
+        dst[i] = src[i];
+    }
+    _mm_sfence();
+}

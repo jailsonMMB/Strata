@@ -4552,6 +4552,24 @@ int main(int argc, char** argv) {
         }
         std::fprintf(stderr, "strata generate: primary device from STRATA_PRIMARY_DEVICE: CUDA%d\n", primary_device);
     }
+#if !defined(STRATA_USE_HIP)
+    {
+        int l2_bytes = 0, max_persist_l2 = 0;
+        int cur_dev = 0;
+        if (cudaGetDevice(&cur_dev) == cudaSuccess) {
+            cudaDeviceGetAttribute(&l2_bytes, cudaDevAttrL2CacheSize, cur_dev);
+            cudaDeviceGetAttribute(&max_persist_l2, cudaDevAttrMaxPersistingL2CacheSize, cur_dev);
+            if (max_persist_l2 > 0) {
+                size_t pin_l2 = std::min<size_t>((size_t) max_persist_l2, 24ULL * 1024 * 1024);
+                cudaError_t err_l2 = cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, pin_l2);
+                if (err_l2 == cudaSuccess) {
+                    std::fprintf(stderr, "strata cuda: dynamic L2 cache pinning enabled: %zu MiB set-aside (total L2: %d MiB, max persisting: %d MiB)\n",
+                                 pin_l2 >> 20, l2_bytes >> 20, max_persist_l2 >> 20);
+                }
+            }
+        }
+    }
+#endif
     // ---- STRATA_EXPERT_NIBBLE=1 keeps the gate/up experts of IQ2_S / IQ3_XXS / IQ3_S layers as 4-bit codes in their VRAM
     // slots (strata/core/expert_nibble.hpp).  Unset or 0: nothing here runs, no table is set, and every slot size below is
     // the GGUF blob's, as before.  On: if anything would read a converted slot as GGUF blocks or write GGUF bytes into

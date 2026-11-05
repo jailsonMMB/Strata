@@ -27,10 +27,34 @@
 #include <windows.h>
 #include "pool_affinity_win.hpp"
 #else
+#include <fcntl.h>
 #include <pthread.h>
 #include <sched.h>
 #include <unistd.h>
 #include "pool_affinity_linux.hpp"
+#endif
+
+#if defined(__x86_64__) || defined(_M_X64)
+#include <xmmintrin.h>
+#include <pmmintrin.h>
+#endif
+
+#if defined(__linux__)
+static int s_cpu_dma_latency_fd = -1;
+static void lock_cpu_dma_latency() {
+    if (s_cpu_dma_latency_fd < 0) {
+        int fd = ::open("/dev/cpu_dma_latency", O_RDWR | O_CLOEXEC);
+        if (fd >= 0) {
+            int32_t latency = 0;
+            if (::write(fd, &latency, sizeof(latency)) == sizeof(latency)) {
+                s_cpu_dma_latency_fd = fd;
+                std::fprintf(stderr, "strata cpu pool: locked /dev/cpu_dma_latency to 0 (C-state wake latency < 1us)\n");
+            } else {
+                ::close(fd);
+            }
+        }
+    }
+}
 #endif
 
 namespace strata::kernels::cpu {
@@ -743,6 +767,13 @@ void ExpertPool::diag(std::FILE* f) const {
 
 ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity affinity, int tasks)
     : tasks_(tasks), host_works_(host_works), affinity_(affinity), topo_(detect_cpu_topology(true, affinity)) {
+#if defined(__linux__)
+    lock_cpu_dma_latency();
+#endif
+#if defined(__x86_64__) || defined(_M_X64)
+    _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
+    _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);
+#endif
     if (tasks < 0 || tasks > kMaxTasks) throw std::invalid_argument("expert pool tasks must be in 0..4096");
     pinned_ = pin;
     layout_ = logical_cpu_layout();   // now, before anything pins the caller (Linux reads the calling thread's allowed CPUs)
@@ -912,11 +943,13 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity af
             std::fprintf(stderr, "strata cpu pool: NUMA split off: %s\n", plan.why.c_str());
         }
     }
-    // A CCX is not a NUMA node.  Opt in only when the six pinned participants
-    // occupy two real three-core L3 domains; otherwise retain the old scheduler.
+    // A CCX is not a NUMA node.  Auto-detect when the six pinned participants
+    // occupy two real three-core L3 domains (e.g. AMD Zen 2); otherwise retain the old scheduler.
+    // STRATA_CCX_SHARD=0 disables it; otherwise enabled automatically when topology matches.
     const char* ccx = std::getenv("STRATA_CCX_SHARD");
+    const bool ccx_disabled = (ccx != nullptr && std::strcmp(ccx, "0") == 0);
 #if defined(__linux__)
-    if (ccx && std::strcmp(ccx, "1") == 0 && !plan.on && pin && host_works_ && n_ == 5 &&
+    if (!ccx_disabled && !plan.on && pin && host_works_ && n_ == 5 &&
         topo_.worker_cores.size() >= 5) {
         std::vector<int> cpus(topo_.worker_cores.begin(), topo_.worker_cores.begin() + 5);
         cpus.push_back(topo_.host_core);
@@ -955,13 +988,14 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity af
             wslice_.assign(slices.begin(), slices.begin() + 5);
             hslice_ = slices[5];
             slice_threads_.assign(2, 3);
-            std::fprintf(stderr, "strata cpu pool: CCX sharding enabled (two L3 domains, 3+3 cores, even/odd experts)\n");
+            std::fprintf(stderr, "strata cpu pool: CCX sharding auto-detected and enabled (two L3 domains, 3+3 cores, even/odd experts)\n");
         }
     }
     if (ccx && std::strcmp(ccx, "1") == 0 && !ccx_shard_)
         std::fprintf(stderr, "strata cpu pool: CCX sharding unavailable; using the existing scheduler\n");
 #else
     (void) ccx;
+    (void) ccx_disabled;
 #endif
     if (n_workers > 0) {
         // recommend, never force: a count above what this CPU uses well runs as configured, with a plain warning
@@ -1026,6 +1060,10 @@ void ExpertPool::publish() {
 }
 
 void ExpertPool::worker(int id) {
+#if defined(__x86_64__) || defined(_M_X64)
+    _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
+    _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);
+#endif
     uint32_t seen = 0;
     // ARRIVE at the park before the first wait, so `parked_ == n_` is true from construction.  Counting only
     // on the RETURN from a drain leaves `parked_` at 0 until each worker has finished one batch, and the first

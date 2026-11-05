@@ -60,6 +60,11 @@ void moe_gemv_q4_0_avx2(const void* STRATA_MOE_RESTRICT weights,
                         int rows,
                         int cols);
 
+/* Sprint 8: Non-temporal streaming write to bypass L3 cache for mapped GPU staging */
+void strata_stream_write_ps(float* STRATA_MOE_RESTRICT dst,
+                            const float* STRATA_MOE_RESTRICT src,
+                            int count);
+
 #undef STRATA_MOE_RESTRICT
 
 #if defined(__cplusplus)
