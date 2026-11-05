@@ -3005,6 +3005,46 @@ if(STRATA_IQ2XS_NVFP4 AND STRATA_ENABLE_CUDA AND NOT STRATA_HIP_GFX906 AND NOT S
       add_test(NAME iq2xs_nvfp4_parity COMMAND iq2xs_nvfp4_parity)
       set_tests_properties(iq2xs_nvfp4_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
     endif()
+
+    # ---- Sprint 10: Tiered KV Cache 256K (K4V2 + Quest + YaRN) ----
+    add_library(strata_tiered_kv_256k STATIC
+      src/core/tiered_kv_256k.cpp
+      src/kernels/cuda/tiered_kv_256k_kernels.cu
+    )
+    set_target_properties(strata_tiered_kv_256k PROPERTIES
+      CUDA_ARCHITECTURES OFF
+      CUDA_STANDARD 17
+      CUDA_STANDARD_REQUIRED ON
+      POSITION_INDEPENDENT_CODE ON
+    )
+    target_compile_options(strata_tiered_kv_256k PRIVATE
+      $<$<COMPILE_LANGUAGE:CUDA>:${_strata_fp4_gencode} -O3 --use_fast_math>
+    )
+    target_include_directories(strata_tiered_kv_256k PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(strata_tiered_kv_256k PUBLIC CUDA::cudart)
+
+    foreach(_tgt IN ITEMS strata strata-arena strata_engine)
+      if(TARGET ${_tgt})
+        target_link_libraries(${_tgt} PRIVATE strata_tiered_kv_256k)
+        target_compile_definitions(${_tgt} PRIVATE STRATA_HAS_TIERED_KV_256K=1)
+      endif()
+    endforeach()
+
+    if(STRATA_BUILD_TESTS)
+      add_executable(tiered_kv_256k_test tests/core/tiered_kv_256k_test.cu)
+      set_target_properties(tiered_kv_256k_test PROPERTIES
+        CUDA_ARCHITECTURES OFF
+        CUDA_STANDARD 17
+        CUDA_STANDARD_REQUIRED ON
+      )
+      target_compile_options(tiered_kv_256k_test PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:${_strata_fp4_gencode} -O3 --use_fast_math>
+      )
+      target_include_directories(tiered_kv_256k_test PRIVATE include)
+      target_link_libraries(tiered_kv_256k_test PRIVATE strata_tiered_kv_256k CUDA::cudart)
+      add_test(NAME tiered_kv_256k_test COMMAND tiered_kv_256k_test)
+    endif()
+
     unset(_strata_fp4_gencode)
   endif()
   if(STRATA_BUILD_TESTS)   # the CPU half needs no GPU and runs on every CUDA build host
