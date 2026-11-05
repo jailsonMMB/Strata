@@ -4008,7 +4008,9 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: --batch-slots %d conflicts with --batch %d\n", o.batch_slots, o.batch);
             return 2;
         }
-        o.batch = o.batch_slots;  // existing serve batch-window machinery; BatchScheduler caps slot contexts
+        if (!o.spec_hybrid) {
+            o.batch = o.batch_slots;  // existing serve batch-window machinery; BatchScheduler caps slot contexts
+        }
     }
     const bool remote_caches = o.expert_cache_remote[0] > 0 || o.expert_cache_remote[1] > 0 ||
                                o.expert_cache_remote[2] > 0;
@@ -4145,6 +4147,10 @@ int main(int argc, char** argv) {
         return 2;
     }
 
+    if (o.ple_io == "uring") {
+        o.ple_io = "direct";
+        ::setenv("STRATA_IO_URING", "1", 1);
+    }
     if ((o.ple_io != "direct" && o.ple_io != "mmap" && o.ple_io != "ram") || o.ple_row_cache < 0 || o.ple_inflight < 1 ||
         o.ple_inflight > 1024 || !(o.ple_delay_us >= 0)) {
         std::fprintf(stderr, "strata generate: invalid --ple-io/--ple-row-cache/--ple-inflight/--ple-delay-us\n");
@@ -18802,6 +18808,10 @@ int main(int argc, char** argv) {
                 live_imgs = imgs_below(req_imgs, (int64_t) live.size());
                 live_ok = o.prompt_cache > 0 && req_ckpt;   // ckpt=0: nothing to continue or park (#830)
                 if (nf_hit) live_ok = false;   // #879 (the next request's start drops the rest)
+                if (live_ok && !live.empty() && radix) {
+                    cur.assign(live.begin(), live.end());
+                    checkpoint_at((int64_t) live.size(), nullptr, false);
+                }
             } else if (!nf_hit && pp_exact && pp_reached > 0 && o.prompt_cache > 0 && req_ckpt &&
                        pp_reached <= (int64_t) cur.size()) {
                 // #1620: stopped between two windows (or before the first token was read): the session is exactly at

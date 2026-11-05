@@ -5,6 +5,9 @@
 // MIT license, third_party/ggml/LICENSE).  The block structs and codebook grids come from its ggml-common.h,
 // included unchanged.
 #include "strata/kernels/iq_kernels.hpp"
+#if defined(STRATA_HAS_IQ2XS_NVFP4)
+#include "strata/kernels/iq2xs_nvfp4.hpp"
+#endif
 #include "strata/core/defaults_026.hpp"
 #include "strata/core/expert_nibble.hpp"
 #include "strata/core/sm75_series.hpp"
@@ -6440,7 +6443,24 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
 #endif
     if (!expdec_gu(L, gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, gate, up))   // STRATA_EXPDEC=1
     switch (L.gu_type) {
+#if defined(STRATA_HAS_IQ2XS_NVFP4)
+#define STRATA_GU(T) \
+    case T: \
+        if constexpr (T == 17) { \
+            static int s_nvfp4_ready = -1; \
+            if (__builtin_expect(s_nvfp4_ready < 0, 0)) { \
+                int dev = 0; \
+                cudaGetDevice(&dev); \
+                s_nvfp4_ready = strata::kernels::iq2xs_nvfp4_available(dev) ? 1 : 0; \
+            } \
+            launch_gu<17>(ggu, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); \
+        } else { \
+            launch_gu<T>(ggu, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); \
+        } \
+        break;
+#else
 #define STRATA_GU(T) case T: launch_gu<T>(ggu, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+#endif
         STRATA_GU_FMTS(STRATA_GU)
 #undef STRATA_GU
         default: std::fprintf(stderr, "native_expert_grouped: gate/up type %d\n", L.gu_type); std::exit(1);

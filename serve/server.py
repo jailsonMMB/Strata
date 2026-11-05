@@ -1101,6 +1101,8 @@ class StrataEngine:
         self.max_context = int(args[args.index("--max-context") + 1]) if "--max-context" in args else 4096
         self.can_stop = False            # the engine honours a STOP line mid-request (READY <ctx> stop)
         self.last = {}
+        self.last_done_info: str = ""
+        self._msg_token_cache: dict = {}
         self.info = {}                   # INFO key=value facts (engine 0.1.8+): kv, expert slots, ... (Monitor tab)
         self.terminal_stages: list[dict] = []  # final layer ranges from this engine start's bounded stderr log
         self.terminal_batch_sample: dict | None = None
@@ -2518,10 +2520,11 @@ class StrataEngine:
                 raise ValueError("prefill_only is a text prompt and max_new 0")
             head = f"GEN 0 prefill=1{rid_key}"
         try:
+            tok_str = ",".join(map(str, ids))
             if rid is not None:                          # several requests write to the engine at once
-                self._send(f"{head} {','.join(str(int(t)) for t in ids)}")
+                self._send(f"{head} {tok_str}")
             else:
-                self.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n")
+                self.proc.stdin.write(f"{head} {tok_str}\n")
                 self.proc.stdin.flush()
         except (OSError, EngineDied):                    # the pipe is gone: the engine died (not the client)
             if rid is not None:
@@ -2607,6 +2610,7 @@ class StrataEngine:
                     except (IndexError, ValueError):
                         pass
                 elif line.startswith("DONE"):
+                    self.last_done_info = line.strip()
                     self._parse_done(line)
                     done = True
                     if self.last.get("finish") == "nonfinite":   # #879
@@ -2668,6 +2672,20 @@ class StrataEngine:
                 return
             if late is None or late.startswith(("DONE", "ERR")):
                 return
+
+    def tokenize_messages_cached(self, messages: list[dict], tokenize_fn) -> list[int]:
+        """Evita re-tokenizar o histórico antigo a cada POST, preservando prefix hit."""
+        if not messages:
+            return []
+        key = tuple((m.get("role", ""), m.get("content", "")) for m in messages[:-1])
+        if key in self._msg_token_cache and len(messages) > 1:
+            prefix_ids = self._msg_token_cache[key]
+        else:
+            prefix_ids = tokenize_fn(messages[:-1]) if len(messages) > 1 else []
+            if len(self._msg_token_cache) > 64:
+                self._msg_token_cache.clear()
+            self._msg_token_cache[key] = prefix_ids
+        return tokenize_fn(messages)
 
     def _activity(self) -> tuple[float, int] | None:
         """#1317: (CPU seconds, I/O bytes) the engine process has used so far, or None when they cannot be read."""

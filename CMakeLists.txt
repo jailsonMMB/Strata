@@ -2990,6 +2990,15 @@ if(STRATA_IQ2XS_NVFP4 AND STRATA_ENABLE_CUDA AND NOT STRATA_HIP_GFX906 AND NOT S
   unset(_strata_fp4_family)
 endif()
 
+if(TARGET strata_iq2xs_nvfp4)
+  foreach(_tgt IN ITEMS strata strata_kernels strata_core)
+    if(TARGET ${_tgt})
+      target_link_libraries(${_tgt} PRIVATE strata_iq2xs_nvfp4)
+      target_compile_definitions(${_tgt} PRIVATE STRATA_HAS_IQ2XS_NVFP4=1)
+    endif()
+  endforeach()
+endif()
+
 # CUDA release kernels must not spill or keep a per-thread array in local memory: every access there is a round trip
 # to device memory in the hottest loops the engine has, and nothing on the build machine says so without -Xptxas -v
 # or a GPU.  tools/check_cuda_spills.py reads the resource usage the compiler wrote into the kernel libraries
