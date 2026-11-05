@@ -79,6 +79,7 @@
 #include "strata/core/mtp.hpp"
 #include "../core/radix_cache.h"
 #include "../core/spec_hybrid.h"
+#include "../core/batch_scheduler.h"
 #include "strata/core/gated_proposal.hpp"
 #if defined(STRATA_HAVE_DFLASH2)
 #include "strata/core/dflash2.hpp"
@@ -967,6 +968,8 @@ struct Options {
     int radix_cache = -1;          // --radix-cache: resolved to serve=1, generate=0
     int spec_hybrid = 0;           // --spec-hybrid: opt-in deterministic MTP + dynamic n-gram
     int spec_ngram_window = 3;     // --spec-ngram-window: 2..4
+    int batch_slots = 1;           // Sprint 5: cooperative slot scheduler cap (maps to --batch when >1)
+    bool batch_slots_given = false;
     /// The MTP's own window cap (0 = --spec): with --spec 6 --mtp-max-t 4 the long windows come from suffix matches.
     int mtp_max_t = 0;
     /// --lookup-chain K (opt-in, 0 = off): prompt lookup CHAINED after the MTP's proposal.  The suffix drafter matches
@@ -3558,6 +3561,7 @@ int main(int argc, char** argv) {
         else if (a == "--radix-cache") o.radix_cache = std::clamp(std::atoi(next("--radix-cache")), 0, 1);
         else if (a == "--spec-hybrid") o.spec_hybrid = std::clamp(std::atoi(next("--spec-hybrid")), 0, 1);
         else if (a == "--spec-ngram-window") o.spec_ngram_window = std::clamp(std::atoi(next("--spec-ngram-window")), 2, 4);
+        else if (a == "--batch-slots") { o.batch_slots = std::atoi(next("--batch-slots")); o.batch_slots_given = true; }
         else if (a == "--mtp-max-t") o.mtp_max_t = std::max(0, std::atoi(next("--mtp-max-t")));
         else if (a == "--lookup-max-t") o.lookup_max_t = std::max(0, std::atoi(next("--lookup-max-t")));
         else if (a == "--lookup-sizes") o.lookup_sizes = next("--lookup-sizes");
@@ -3981,6 +3985,17 @@ int main(int argc, char** argv) {
     if (o.resident_cpu_experts && (!o.mmap_experts || o.expert_profile.empty())) {
         std::fprintf(stderr, "strata generate: --resident-cpu-experts requires --mmap-experts and a static --expert-profile\n");
         return 2;
+    }
+    if (o.batch_slots < 1 || o.batch_slots > 8) {
+        std::fprintf(stderr, "strata generate: --batch-slots must be in [1,8]\n");
+        return 2;
+    }
+    if (o.batch_slots_given && o.batch_slots > 1) {
+        if (o.batch != 0 && o.batch != o.batch_slots) {
+            std::fprintf(stderr, "strata generate: --batch-slots %d conflicts with --batch %d\n", o.batch_slots, o.batch);
+            return 2;
+        }
+        o.batch = o.batch_slots;  // existing serve batch-window machinery; BatchScheduler caps slot contexts
     }
     const bool remote_caches = o.expert_cache_remote[0] > 0 || o.expert_cache_remote[1] > 0 ||
                                o.expert_cache_remote[2] > 0;
