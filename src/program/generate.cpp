@@ -77,6 +77,8 @@
 #include "strata/core/spill_gate.hpp"
 #include "strata/core/verify.hpp"
 #include "strata/core/mtp.hpp"
+#include "../core/radix_cache.h"
+#include "../core/spec_hybrid.h"
 #include "strata/core/gated_proposal.hpp"
 #if defined(STRATA_HAVE_DFLASH2)
 #include "strata/core/dflash2.hpp"
@@ -962,6 +964,9 @@ struct Options {
     /// it there instead of the MTP's drafts, where the MTP's own first guess agrees and the draft policy expects it to
     /// pay (strata/spec/draft_policy.hpp).  On by default; 0 = MTP only.
     int suffix_draft = 3;
+    int radix_cache = -1;          // --radix-cache: resolved to serve=1, generate=0
+    int spec_hybrid = 0;           // --spec-hybrid: opt-in deterministic MTP + dynamic n-gram
+    int spec_ngram_window = 3;     // --spec-ngram-window: 2..4
     /// The MTP's own window cap (0 = --spec): with --spec 6 --mtp-max-t 4 the long windows come from suffix matches.
     int mtp_max_t = 0;
     /// --lookup-chain K (opt-in, 0 = off): prompt lookup CHAINED after the MTP's proposal.  The suffix drafter matches
@@ -1137,6 +1142,9 @@ void usage() {
                  "                       of the batched prompt path (default 64, 0 = off)\n"
                  "  --prefill-head-alias --serve: unload the native output head while each fresh prompt is read,\n"
                  "                       then release prompt buffers and reload it before decode\n"
+                 "  --radix-cache 0|1    prefix KV trie index (default: serve 1, generate 0)\n"
+                 "  --spec-hybrid 0|1    deterministic MTP + dynamic n-gram drafts (default 0)\n"
+                 "  --spec-ngram-window N  hybrid n-gram order 2..4 (default 3)\n"
                  "  --suffix-draft N     prompt lookup: draft from an earlier repeat of the last N+ tokens of context\n"
                  "                       when it pays (default 3; 0 = MTP only)\n"
                  "  --mtp-max-t M        cap the MTP's windows at M tokens (0 = --spec; longer ones come from suffixes)\n"
@@ -3547,6 +3555,9 @@ int main(int argc, char** argv) {
         else if (a == "--prefill-head-alias") o.prefill_head_alias = true;
         else if (a == "--pipeline-windows") o.pipeline_windows = std::max(0, std::min(2, std::atoi(next("--pipeline-windows"))));
         else if (a == "--suffix-draft") o.suffix_draft = std::max(0, std::atoi(next("--suffix-draft")));
+        else if (a == "--radix-cache") o.radix_cache = std::clamp(std::atoi(next("--radix-cache")), 0, 1);
+        else if (a == "--spec-hybrid") o.spec_hybrid = std::clamp(std::atoi(next("--spec-hybrid")), 0, 1);
+        else if (a == "--spec-ngram-window") o.spec_ngram_window = std::clamp(std::atoi(next("--spec-ngram-window")), 2, 4);
         else if (a == "--mtp-max-t") o.mtp_max_t = std::max(0, std::atoi(next("--mtp-max-t")));
         else if (a == "--lookup-max-t") o.lookup_max_t = std::max(0, std::atoi(next("--lookup-max-t")));
         else if (a == "--lookup-sizes") o.lookup_sizes = next("--lookup-sizes");
@@ -4133,6 +4144,16 @@ int main(int argc, char** argv) {
     // Prompt lookup (the suffix drafter, on by default): the MTP keeps its --spec windows and a lookup window may be
     // up to 2 tokens longer; the draft policy (strata/spec/draft_policy.hpp) takes one only where it pays. Code
     // edits +6-11%, ordinary text unchanged (bench/results/2026-09-27-spec). --suffix-draft 0 turns it off.
+    if (o.radix_cache < 0) o.radix_cache = o.serve ? 1 : 0;
+    if (o.spec_hybrid) {
+        if (o.mtp.empty() || o.spec < 2 || o.batch > 0 || !o.layer_split.empty() || o.pipeline_windows > 1 ||
+            o.lookup_chain > 0 || o.spec_corrupt > 0 || !o.spec_follow.empty() || o.draft == "dflash2") {
+            std::fprintf(stderr, "strata: --spec-hybrid 1 needs serial single-GPU MTP (--mtp, --spec >=2), no batch/split/pipeline/lookup-chain/dflash2/diagnostics\n");
+            return 1;
+        }
+        o.suffix_draft = 0; // the hybrid owns the CPU lookup source; avoid two competing suffix policies
+        std::fprintf(stderr, "strata: hybrid speculation on (%d-gram window, deterministic verification)\n", o.spec_ngram_window);
+    }
     if (o.suffix_draft > 0 && o.spec >= 2 && o.mtp_max_t == 0) {
         o.mtp_max_t = o.spec;
         o.spec = std::min(o.spec + 2, 8);   // kVerifyMaxT
@@ -11392,6 +11413,8 @@ int main(int argc, char** argv) {
         // a reporter's prompts failed there every time and passed with --short-read 0.
         bool nf_prompt_windows = false, short_read_off_once = false;
         std::vector<ConvCheckpoint> checks;
+        std::unique_ptr<strata::core::RadixCache> radix;
+        if (o.radix_cache) radix = std::make_unique<strata::core::RadixCache>(256, size_t(std::max(1, o.prompt_cache)) * size_t((o.max_context + 255) / 256));
         // KVA: which prefixes of token ids a KVA read approximated, so the draft layer knows, for whatever state a request
         // continues from, the first cell built from a real row (kva_floor.hpp).  Empty without KVA.
         strata::prefill::KvaFloorRegistry kva_floors;
@@ -11959,6 +11982,7 @@ int main(int argc, char** argv) {
                 tail_ckpt_len = -1;   // the flagged tail was dropped and a normal checkpoint takes its length
             }
             checks.push_back(std::move(c));
+            if (radix) { const size_t i = checks.size()-1; radix->insert(checks.back().ids, uint64_t(checks.size()), [i](size_t b){ return strata::core::RadixBlockRef{uint64_t(i+1), uint32_t(b*256)}; }); }
             const Clock::time_point te0 = Clock::now();
             const size_t before_evict = checks.size();
             while ((int) checks.size() > o.prompt_cache) {
@@ -13396,6 +13420,8 @@ int main(int argc, char** argv) {
         // --pipeline-windows 2 loads the drafter with 8 rows: the serial loop's chain keeps its own length
         else if (use_mtp && mtp.max_t() > S_mtp) mtp.set_max_drafts(S_mtp - 1);
         strata::spec::SuffixDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
+        strata::core::SpecHybrid hybrid(o.spec_ngram_window, 4096, size_t(o.max_context) + 4096);
+        bool hybrid_on = false;
         strata::spec::DraftPolicy policy(S);   // MTP or lookup window, learned over the whole process
         strata::spec::DraftPolicy policy_idle(S);   // --draft auto: the other drafter's learned costs; swapped in with it when a request uses the other drafter
         bool policy_is_df2 = use_df2;   // which drafter's costs `policy` holds (the engine's first drafter; swapped with policy_idle when a request uses the other one)
@@ -15356,6 +15382,11 @@ int main(int argc, char** argv) {
                 wait_before[(size_t) r] = remote_experts[(size_t) r].ms_wait();
             }
             cur = ids;
+            if (radix) {
+                radix->clear();
+                for (size_t i=0; i<checks.size(); ++i)
+                    radix->insert(checks[i].ids, uint64_t(i+1), [i](size_t b){ return strata::core::RadixBlockRef{uint64_t(i+1), uint32_t(b*256)}; });
+            }
             const Clock::time_point r0 = Clock::now();
             tr("r0");
             strata::core::conversation_checkpoint_join(nullptr);   // STRATA_CKPT_ASYNC: the last save's copy has landed
@@ -15483,11 +15514,19 @@ int main(int argc, char** argv) {
             bool from_live = false;
             if (o.prompt_cache > 0 && want_cvec == cvec_cached) {
                 if (live_ok && starts_with(live, live_imgs)) { resume = (int64_t) live.size(); from_live = true; }
-                for (const ConvCheckpoint& c : checks)
-                    if ((int64_t) c.ids.size() > resume && starts_with(c.ids, c.imgs)) {
-                        resume = (int64_t) c.ids.size();
-                        from_live = false;
+                bool radix_used = false;
+                if (radix) {
+                    std::vector<int32_t> tok(ids.begin(), ids.end());
+                    const auto hit = radix->find_longest_prefix(tok);
+                    if (hit.payload && hit.payload <= checks.size()) {
+                        const ConvCheckpoint& c = checks[size_t(hit.payload-1)];
+                        if ((int64_t)c.ids.size() > resume && starts_with(c.ids, c.imgs)) { resume = (int64_t)c.ids.size(); from_live = false; radix_used = true; }
                     }
+                }
+                if (!radix_used) {
+                    for (const ConvCheckpoint& c : checks)
+                        if ((int64_t) c.ids.size() > resume && starts_with(c.ids, c.imgs)) { resume = (int64_t)c.ids.size(); from_live = false; }
+                }
             }
             // STRATA_SLOT_CKPT_MOVE: a turn checkpoint a batch admission moved into its slot is still one of the main
             // session's while the main session holds its tokens (the cells below it are the ones it was taken over):
@@ -17384,6 +17423,10 @@ int main(int argc, char** argv) {
             std::array<int32_t, 16> tr_s{};
             int tr_k = 0, tr_match = 0;
             std::vector<int32_t> sbuf((size_t) S, 0);
+            hybrid_on = o.spec_hybrid && use_mtp && !req_df2 && req_sp.temperature == 0.0f && !gated_proposal && !pipe && o.batch == 0 && stages.empty() && !multi_gpu;
+            mtp.set_spec_hybrid(hybrid_on ? &hybrid : nullptr);
+            struct HybridReset { strata::core::MtpDrafter& m; ~HybridReset() { m.set_spec_hybrid(nullptr); } } hybrid_reset{mtp};
+            if (hybrid_on) { hybrid.reset(); std::vector<int32_t> t(ids.begin(), ids.end()); hybrid.observe(t.data(), t.size()); }
             const bool sfx_on = o.suffix_draft > 0 || o.lookup_chain > 0;
             if (sfx_on) {
                 sfx.reset();
@@ -18242,6 +18285,7 @@ int main(int argc, char** argv) {
                         }
                     }
                 }
+                if (hybrid_on && !first_window && mtp.last_hybrid_count() > 0) T = std::min(T, mtp.last_hybrid_count() + 1);
                 if (dfr_lookup) {   // the lookup window chosen before the draft (the draft was skipped)
                     sfx.propose(S_look - 1, sbuf.data());
                     T = dfr_T; from_sfx = true; sfx_match = dfr_match;
@@ -18561,6 +18605,7 @@ int main(int argc, char** argv) {
                     strata::core::progress_beat();
                     ++produced_n;
                     if (sfx_on) sfx.append(outv[(size_t) i]);
+                    if (hybrid_on) hybrid.observe(outv[(size_t) i]);
                     if (o.lookup_chain > 0) extra_sources_append(&outv[(size_t) i], 1);
                     eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) i]) != o.eos_ids.end();
                 }
@@ -20002,6 +20047,9 @@ int main(int argc, char** argv) {
         int64_t rounds = 0, drafts_total = 0, drafts_ok = 0, corrupt_counter = 0;
         if (use_mtp && S_mtp < o.spec) mtp.set_max_drafts(S_mtp - 1);
         strata::spec::SuffixDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
+        strata::core::SpecHybrid hybrid(o.spec_ngram_window, 4096, size_t(o.max_context) + 4096);
+        const bool hybrid_on = o.spec_hybrid && use_mtp && !spec_uses_df2 && !gated_proposal && o.batch == 0;
+        mtp.set_spec_hybrid(hybrid_on ? &hybrid : nullptr);
         strata::spec::DraftPolicy policy(o.spec);   // MTP or lookup window (see draft_policy.hpp)
         auto source_policy = policy;   // this generation's: committed outcomes only (observe_committed)
         strata::spec::DraftPolicy::ChainState chain_st;
@@ -20035,6 +20083,7 @@ int main(int argc, char** argv) {
         std::vector<int32_t> cbuf((size_t) o.spec, 0), ctail;
         strata::spec::PromptLookupSource lookup_src(sfx);
         const bool sfx_on = o.suffix_draft > 0 || o.lookup_chain > 0;
+        if (hybrid_on) { std::vector<int32_t> t(o.tokens.begin(), o.tokens.end()); hybrid.observe(t.data(), t.size()); for (int64_t v : produced) hybrid.observe(int32_t(v)); }
         if (sfx_on) {
             for (int64_t t : o.tokens) sfx.append((int32_t) t);
             for (int64_t t : produced) sfx.append((int32_t) t);
@@ -20172,6 +20221,7 @@ int main(int argc, char** argv) {
                 T = strata::spec::choose_window(wr);
             }
             if (first_window) T = 1;
+            if (hybrid_on && !first_window && mtp.last_hybrid_count() > 0) T = std::min(T, mtp.last_hybrid_count() + 1);
             std::copy(dprob.begin(), dprob.begin() + (std::ptrdiff_t) o.spec, dwin.begin());
             if (!t_cycle.empty() && !first_window) T = t_cycle[(size_t) (rounds % (int64_t) t_cycle.size())];
             if (o.suffix_draft > 0 && !first_window) {
@@ -20315,6 +20365,7 @@ int main(int argc, char** argv) {
             bool eos = false;
             for (int i = 0; i <= a && (int64_t) produced.size() < max_new && !eos; ++i) {
                 produced.push_back(outv[(size_t) i]);
+                if (hybrid_on) hybrid.observe(outv[(size_t) i]);
                 if (sfx_on) sfx.append(outv[(size_t) i]);
                 if (o.lookup_chain > 0) extra_sources_append(&outv[(size_t) i], 1);
                 eos = o.stop_eos && std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) i]) != o.eos_ids.end();

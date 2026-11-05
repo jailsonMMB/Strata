@@ -33,6 +33,7 @@
 #include <vector>
 
 namespace strata::core {
+class SpecHybrid;
 
 class NativeHead;
 
@@ -57,6 +58,9 @@ public:
     }
     /// At most this many drafts per round (below max_t - 1): a window longer than the MTP's comes from elsewhere.
     void set_max_drafts(int k) { max_drafts_ = k; }
+    // Opt-in CPU continuation oracle. The verifier still decides every emitted token.
+    void set_spec_hybrid(SpecHybrid* h) { hybrid_ = h; last_hybrid_count_ = 0; }
+    int last_hybrid_count() const { return last_hybrid_count_; }
     /// --mtp-hnorm stream (opt-in; before the first draft or prefill): pre_fc_norm_hidden normalizes each
     /// hyper-connection stream on its own, as llama.cpp's qwen4exp MTP graph does, instead of one RMS over all four.
     void set_hnorm_per_stream(bool on) { hnorm_stream_ = on; }
@@ -274,6 +278,8 @@ private:
     int max_t_ = 0;
     int device_ = -1;   ///< the device `load` ran on: the public calls switch to it (layer split)
     int max_drafts_ = 1 << 30;
+    SpecHybrid* hybrid_ = nullptr;
+    int last_hybrid_count_ = 0;
     bool hnorm_stream_ = false;
     bool q4_ = false, q4_head_ = false;
     uint8_t* dense4_ = nullptr;              ///< --mtp-q4: Q4_0 copies of the Q8_0 tensors
