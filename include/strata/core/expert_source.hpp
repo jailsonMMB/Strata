@@ -959,8 +959,8 @@ public:
     void warm_scored(int64_t layer, const int64_t* experts, const float* conf, int64_t n, int ahead) override;
     bool io_sched() const { return io_sched_; }
     bool wants_scores() const override { return io_sched_ && io_pf_; }
-    /// Not when the reads are unbuffered: the warmed pages would be read through the file cache, a second time.
-    bool warms() const override { return (!role_ptr_.empty() || io_pf_) && direct_.empty(); }
+    /// When in resident RAM mode (complement_ready_), warming prefetches resident blobs into CPU cache.
+    bool warms() const override { return complement_ready_ || ((!role_ptr_.empty() || io_pf_) && direct_.empty()); }
     /// Of the blobs the file tier read for the decode, how many had been warmed for their layer beforehand.
     int64_t warmed_hits() const { return warm_hits_.load(std::memory_order_relaxed); }
     int64_t warmed() const { return warm_count_.load(std::memory_order_relaxed); }

@@ -8528,7 +8528,7 @@ int main(int argc, char** argv) {
             else if (srcp == &src && src.io_prefetch())
                 lookahead.set_depth(2);
             std::fprintf(stderr, "strata generate: routing-aware prefetch on (the next layer's router%s)\n",
-                         fs_ahead ? ", feeding the Foresight swap space" : ", file tier");
+                         fs_ahead ? ", feeding the Foresight swap space" : (srcp == &src && src.complement_ready()) ? ", resident RAM cache prewarm" : ", file tier");
         } else {
             (void) cudaGetLastError();
             std::fprintf(stderr, "strata generate: routing-aware prefetch off (%s)\n",

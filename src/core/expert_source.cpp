@@ -1142,7 +1142,26 @@ void FileExpertSource::warm_scored(int64_t layer, const int64_t* experts, const 
             const int64_t e = experts[j];
             if (e < 0 || e >= n_expert_) continue;
             const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) e;
-            if (complement_ready_ && resident_blob(index) != nullptr) continue;   // in the RAM copy
+            if (complement_ready_) {
+                const uint8_t* rb = resident_blob(index);
+                if (rb != nullptr) {
+                    const size_t sz = layer < (int64_t) layer_blob_bytes_.size() ? layer_blob_bytes_[(size_t) layer] : 0;
+                    if (sz > 0) {
+                        const char* p = reinterpret_cast<const char*>(rb);
+                        const char* end = p + std::min<size_t>(sz, 65536);
+                        while (p < end) {
+#if defined(__x86_64__) || defined(_M_X64)
+                            _mm_prefetch(p, _MM_HINT_T0);
+#else
+                            __builtin_prefetch(p, 0, 3);
+#endif
+                            p += 64;
+                        }
+                    }
+                    warm_count_.fetch_add(1, std::memory_order_relaxed);
+                    continue;   // in the RAM copy (cache-prewarmed)
+                }
+            }
             warm_count_.fetch_add(1, std::memory_order_relaxed);
             const double pressure = std::min(1.0, (double) io_q_bytes_ / (double) std::max<uint64_t>(1, budget));
             const double bar = (double) io_minconf_ + (1.0 - (double) io_minconf_) * pressure;
@@ -3070,7 +3089,8 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
 }
 
 void FileExpertSource::warm(int64_t layer, const int64_t* experts, int64_t n) {
-    if ((role_ptr_.empty() && !io_pf_) || n <= 0 || layer < 0 || layer >= n_layers_) return;
+    if (!complement_ready_ && (role_ptr_.empty() && !io_pf_)) return;
+    if (n <= 0 || layer < 0 || layer >= n_layers_) return;
     uint32_t stamp;
     {
         std::lock_guard<std::mutex> lk(stage_mu_);
@@ -3085,8 +3105,26 @@ void FileExpertSource::warm(int64_t layer, const int64_t* experts, int64_t n) {
         const int64_t e = experts[j];
         if (e < 0 || e >= n_expert_) continue;
         const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) e;
-        if (complement_ready_ && resident_blob(index) != nullptr)
-            continue;                                                    // in the RAM copy
+        if (complement_ready_) {
+            const uint8_t* rb = resident_blob(index);
+            if (rb != nullptr) {
+                const size_t sz = layer < (int64_t) layer_blob_bytes_.size() ? layer_blob_bytes_[(size_t) layer] : 0;
+                if (sz > 0) {
+                    const char* p = reinterpret_cast<const char*>(rb);
+                    const char* end = p + std::min<size_t>(sz, 65536);
+                    while (p < end) {
+#if defined(__x86_64__) || defined(_M_X64)
+                        _mm_prefetch(p, _MM_HINT_T0);
+#else
+                        __builtin_prefetch(p, 0, 3);
+#endif
+                        p += 64;
+                    }
+                }
+                warm_count_.fetch_add(1, std::memory_order_relaxed);
+                continue;   // in the RAM copy (cache-prewarmed)
+            }
+        }
         if (warm_stamp_) warm_stamp_[index].store(stamp, std::memory_order_relaxed);
         warm_count_.fetch_add(1, std::memory_order_relaxed);
         if (io_pf_ && direct_.empty() && gate_open()) {   // read it ahead with pread on the I/O threads (instead of an madvise hint)
