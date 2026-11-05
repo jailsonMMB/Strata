@@ -26,6 +26,9 @@
 #include "ggml.h"  // Sprint 5: ggml to_float for the resident-quant sidecar build (startup only)
 
 #include <cuda_runtime.h>
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
 #ifndef _WIN32
 #include <signal.h>
 #include <unistd.h>
@@ -258,12 +261,19 @@ bool make_cache_complement_plan(
         }
     }
 
+    const bool hugepage_repack = (std::getenv("STRATA_REPACK_HUGEPAGE") != nullptr &&
+                                  std::atoi(std::getenv("STRATA_REPACK_HUGEPAGE")) > 0);
+    constexpr uint64_t kHugePage2MB = 2ULL * 1024ULL * 1024ULL;
+
     offsets.assign(count, kNoCacheComplement);
     for (int64_t layer = 0; layer < n_layers; ++layer) {
         const uint64_t blob_bytes = layer_blob_bytes[(size_t) layer];
         for (int64_t expert = 0; expert < n_expert; ++expert) {
             const size_t index = (size_t) layer * (size_t) n_expert + (size_t) expert;
             if (omitted[index] != 0) continue;
+            if (hugepage_repack && (bytes % kHugePage2MB != 0)) {
+                bytes = (bytes + kHugePage2MB - 1) & ~(kHugePage2MB - 1);
+            }
             if (bytes > std::numeric_limits<uint64_t>::max() - blob_bytes) {
                 offsets.clear();
                 bytes = 0;

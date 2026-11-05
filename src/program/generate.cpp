@@ -80,6 +80,13 @@
 #include "../core/radix_cache.h"
 #include "../core/spec_hybrid.h"
 #include "../core/batch_scheduler.h"
+#include "strata/core/shm_ipc.hpp"
+#include "strata/core/snap_kv.hpp"
+#include "strata/core/early_exit.hpp"
+
+static strata::core::StrataShmIPC* g_active_shm_ipc = nullptr;
+static strata::core::SnapKVSelector* g_active_snap_kv = nullptr;
+static strata::core::EarlyExitEvaluator* g_active_early_exit = nullptr;
 #include "strata/core/gated_proposal.hpp"
 #if defined(STRATA_HAVE_DFLASH2)
 #include "strata/core/dflash2.hpp"
@@ -970,6 +977,10 @@ struct Options {
     /// pay (strata/spec/draft_policy.hpp).  On by default; 0 = MTP only.
     int suffix_draft = 3;
     int radix_cache = -1;          // --radix-cache: resolved to serve=1, generate=0
+    std::string shm_ipc;           // --shm-ipc <path>: zero-copy ring buffer in /dev/shm
+    int snap_kv = 0;               // --snap-kv 0|1: selective attention (Top-512) for long contexts
+    int early_exit = 0;            // --early-exit 0|1: layer 36 confidence early exit
+    float early_exit_margin = 0.992f; // --early-exit-margin <float>
     int spec_hybrid = 0;           // --spec-hybrid: opt-in deterministic MTP + dynamic n-gram
     int spec_ngram_window = 3;     // --spec-ngram-window: 2..4
     /// The MTP's own window cap (0 = --spec): with --spec 6 --mtp-max-t 4 the long windows come from suffix matches.
@@ -3563,6 +3574,10 @@ int main(int argc, char** argv) {
         else if (a == "--pipeline-windows") o.pipeline_windows = std::max(0, std::min(2, std::atoi(next("--pipeline-windows"))));
         else if (a == "--suffix-draft") o.suffix_draft = std::max(0, std::atoi(next("--suffix-draft")));
         else if (a == "--radix-cache") o.radix_cache = std::clamp(std::atoi(next("--radix-cache")), 0, 1);
+        else if (a == "--shm-ipc") o.shm_ipc = next("--shm-ipc");
+        else if (a == "--snap-kv") o.snap_kv = std::clamp(std::atoi(next("--snap-kv")), 0, 1);
+        else if (a == "--early-exit") o.early_exit = std::clamp(std::atoi(next("--early-exit")), 0, 1);
+        else if (a == "--early-exit-margin") o.early_exit_margin = std::max(0.5f, std::min(0.9999f, (float)std::atof(next("--early-exit-margin"))));
         else if (a == "--spec-hybrid") o.spec_hybrid = std::clamp(std::atoi(next("--spec-hybrid")), 0, 1);
         else if (a == "--spec-ngram-window") o.spec_ngram_window = std::clamp(std::atoi(next("--spec-ngram-window")), 2, 4);
         else if (a == "--mtp-max-t") o.mtp_max_t = std::max(0, std::atoi(next("--mtp-max-t")));
@@ -11468,6 +11483,23 @@ int main(int argc, char** argv) {
         std::vector<ConvCheckpoint> checks;
         std::unique_ptr<strata::core::RadixCache> radix;
         if (o.radix_cache) radix = std::make_unique<strata::core::RadixCache>(256, size_t(std::max(1, o.prompt_cache)) * size_t((o.max_context + 255) / 256));
+        std::unique_ptr<strata::core::StrataShmIPC> shm_ipc_inst;
+        if (!o.shm_ipc.empty()) {
+            shm_ipc_inst = std::make_unique<strata::core::StrataShmIPC>();
+            if (shm_ipc_inst->init_producer(o.shm_ipc)) {
+                g_active_shm_ipc = shm_ipc_inst.get();
+            }
+        }
+        std::unique_ptr<strata::core::SnapKVSelector> snap_kv_inst;
+        if (o.snap_kv) {
+            snap_kv_inst = std::make_unique<strata::core::SnapKVSelector>(48, o.max_context);
+            g_active_snap_kv = snap_kv_inst.get();
+        }
+        std::unique_ptr<strata::core::EarlyExitEvaluator> early_exit_inst;
+        if (o.early_exit) {
+            early_exit_inst = std::make_unique<strata::core::EarlyExitEvaluator>(o.early_exit_margin);
+            g_active_early_exit = early_exit_inst.get();
+        }
         // KVA: which prefixes of token ids a KVA read approximated, so the draft layer knows, for whatever state a request
         // continues from, the first cell built from a real row (kva_floor.hpp).  Empty without KVA.
         strata::prefill::KvaFloorRegistry kva_floors;
@@ -18077,6 +18109,7 @@ int main(int argc, char** argv) {
                     bool eos = false;
                     for (int i = 0; !nf && i <= a && produced_n < max_new && !eos; ++i) {
                         std::printf("T %d\n", (int) outp[(size_t) i]);
+                        if (g_active_shm_ipc) g_active_shm_ipc->emit_token((int32_t) outp[(size_t) i]);
                         if (req_logprobs >= 0) emit_lp_line(V1(A), i, outp[(size_t) i], req_logprobs, req_allowed);
                         strata::core::progress_beat();
                         ++produced_n;
@@ -18654,6 +18687,7 @@ int main(int argc, char** argv) {
                 bool eos = false;
                 for (int i = merged ? a : 0; i <= a && produced_n < max_new && !eos; ++i) {   // (merged: row T-1 only)
                     std::printf("T %d\n", (int) outv[(size_t) i]);
+                    if (g_active_shm_ipc) g_active_shm_ipc->emit_token((int32_t) outv[(size_t) i]);
                     if (req_logprobs >= 0) emit_lp_line(ver, i, outv[(size_t) i], req_logprobs, req_allowed);
                     strata::core::progress_beat();
                     ++produced_n;

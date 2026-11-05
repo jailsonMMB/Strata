@@ -250,6 +250,21 @@ if(STRATA_BUILD_TESTS)
     target_compile_options(async_pipeline_test PRIVATE -mavx2 -mfma)
   endif()
   add_test(NAME async_pipeline_test COMMAND async_pipeline_test)
+
+  add_executable(snapkv_early_exit_test
+    src/core/shm_ipc.cpp
+    src/core/snap_kv.cpp
+    src/core/early_exit.cpp
+    tests/core/snapkv_early_exit_test.cpp
+  )
+  target_compile_features(snapkv_early_exit_test PRIVATE cxx_std_17)
+  target_include_directories(snapkv_early_exit_test PRIVATE include src/core)
+  target_link_libraries(snapkv_early_exit_test PRIVATE Threads::Threads rt)
+  add_test(NAME snapkv_early_exit_test COMMAND snapkv_early_exit_test)
+
+  add_executable(strata-repack tools/strata_repack.cpp)
+  target_compile_features(strata-repack PRIVATE cxx_std_17)
+  target_include_directories(strata-repack PRIVATE include)
 endif()
 
 if(STRATA_HIP_GFX906)
@@ -768,7 +783,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp src/core/dflash2.cpp
     src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp
     src/core/arch_defaults.cpp src/core/nv_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp
-    src/core/radix_cache.cpp src/core/spec_hybrid.cpp src/core/batch_scheduler.cpp src/core/resident_quant.cpp)
+    src/core/radix_cache.cpp src/core/spec_hybrid.cpp src/core/batch_scheduler.cpp src/core/resident_quant.cpp
+    src/core/shm_ipc.cpp src/core/snap_kv.cpp src/core/early_exit.cpp)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
   if(_strata_uring_sources)
