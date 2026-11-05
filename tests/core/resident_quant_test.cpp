@@ -1,5 +1,5 @@
 #include "strata/cpu_kernels_avx2.h"
-#include "../../src/core/resident_quant.h"
+#include "strata/core/resident_quant.hpp"
 
 #include <cmath>
 #include <cstdint>

@@ -1,4 +1,4 @@
-#include "resident_quant.h"
+#include "strata/core/resident_quant.hpp"
 
 #include <algorithm>
 #include <cmath>

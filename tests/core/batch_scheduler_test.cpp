@@ -1,4 +1,4 @@
-#include "../../src/core/batch_scheduler.h"
+#include "strata/core/batch_scheduler.hpp"
 #include <atomic>
 #include <cstdio>
 #include <thread>

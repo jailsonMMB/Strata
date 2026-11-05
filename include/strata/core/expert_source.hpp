@@ -26,7 +26,7 @@
 #include "strata/core/exchange_storage.hpp"
 #include "strata/core/hit_hook.hpp"
 #include "strata/kernels/cpu/pool.hpp"
-#include "../../../src/core/resident_quant.h"
+#include "strata/core/resident_quant.hpp"
 
 #include <algorithm>
 #include <array>

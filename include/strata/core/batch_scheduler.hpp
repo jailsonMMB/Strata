@@ -4,7 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <vector>
-#include "radix_cache.h"
+#include "strata/core/radix_cache.hpp"
 
 namespace strata::core {
 

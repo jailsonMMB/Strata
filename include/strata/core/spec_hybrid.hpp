@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <vector>
+#include "strata/spec/draft_source.hpp"
 
 namespace strata::core {
 
@@ -178,4 +179,22 @@ private:
 // target logits decide every emitted token; drafts only supply candidates.
 int greedy_accept_prefix(const int32_t* drafts, int n, const int32_t* target,
                          int32_t* emitted, int max_emitted);
+
+class SpecHybridDraftSource final : public strata::spec::DraftSource {
+public:
+    explicit SpecHybridDraftSource(SpecHybrid& h) : h_(h) {}
+    const char* name() const override { return "spec-hybrid"; }
+    void reset() override { h_.reset(); }
+    void append(const int32_t* tokens, size_t n) override { h_.observe(tokens, n); }
+    int propose(const int32_t* tail, int n_tail, int n_pending, int max_k, int32_t* out, int* match) override {
+        (void) tail; (void) n_tail; (void) n_pending;
+        const int k = h_.propose(max_k, out);
+        if (match) *match = k > 0 ? h_.last_order() : 0;
+        return k;
+    }
+
+private:
+    SpecHybrid& h_;
+};
+
 } // namespace strata::core

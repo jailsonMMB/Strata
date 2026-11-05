@@ -42,13 +42,18 @@
 #if defined(__linux__)
 static int s_cpu_dma_latency_fd = -1;
 static void lock_cpu_dma_latency() {
+    // Only lock CPU DMA latency if explicitly requested by user to prevent unnecessary power draw/heating
+    const char* env = std::getenv("STRATA_LOCK_DMA_LATENCY");
+    if (!env || (std::strcmp(env, "1") != 0 && std::strcmp(env, "true") != 0)) {
+        return;
+    }
     if (s_cpu_dma_latency_fd < 0) {
         int fd = ::open("/dev/cpu_dma_latency", O_RDWR | O_CLOEXEC);
         if (fd >= 0) {
             int32_t latency = 0;
             if (::write(fd, &latency, sizeof(latency)) == sizeof(latency)) {
                 s_cpu_dma_latency_fd = fd;
-                std::fprintf(stderr, "strata cpu pool: locked /dev/cpu_dma_latency to 0 (C-state wake latency < 1us)\n");
+                std::fprintf(stderr, "strata cpu pool: locked /dev/cpu_dma_latency to 0 (opt-in C-state wake latency < 1us)\n");
             } else {
                 ::close(fd);
             }
@@ -988,7 +993,7 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity af
             wslice_.assign(slices.begin(), slices.begin() + 5);
             hslice_ = slices[5];
             slice_threads_.assign(2, 3);
-            std::fprintf(stderr, "strata cpu pool: CCX sharding auto-detected and enabled (two L3 domains, 3+3 cores, even/odd experts)\n");
+            std::fprintf(stderr, "strata cpu pool: CCX dynamic balanced sharding enabled (two L3 domains, 3+3 cores)\n");
         }
     }
     if (ccx && std::strcmp(ccx, "1") == 0 && !ccx_shard_)
@@ -1480,6 +1485,17 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
             for (int e = 0; e < nb; ++e) {
                 const int id = mjobs_[e].expert_id;
                 ccx_jobs_[ccx_owner(id >= 0 ? id : e)].push_back(e);
+            }
+            // Dynamic rebalancing: prevent CCX core starvation if routing activates predominantly even or odd experts
+            while (ccx_jobs_[0].size() > ccx_jobs_[1].size() + 1) {
+                int victim = ccx_jobs_[0].back();
+                ccx_jobs_[0].pop_back();
+                ccx_jobs_[1].push_back(victim);
+            }
+            while (ccx_jobs_[1].size() > ccx_jobs_[0].size() + 1) {
+                int victim = ccx_jobs_[1].back();
+                ccx_jobs_[1].pop_back();
+                ccx_jobs_[0].push_back(victim);
             }
         }
         nfmt_ = &f;

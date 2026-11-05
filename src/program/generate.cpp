@@ -80,9 +80,9 @@
 #include "strata/core/pcie_share_rule.hpp"
 #include "strata/core/verify.hpp"
 #include "strata/core/mtp.hpp"
-#include "../core/radix_cache.h"
-#include "../core/spec_hybrid.h"
-#include "../core/batch_scheduler.h"
+#include "strata/core/radix_cache.hpp"
+#include "strata/core/spec_hybrid.hpp"
+#include "strata/core/batch_scheduler.hpp"
 #include "strata/core/shm_ipc.hpp"
 #include "strata/core/snap_kv.hpp"
 #include "strata/core/early_exit.hpp"
@@ -17900,8 +17900,6 @@ int main(int argc, char** argv) {
             int tr_k = 0, tr_match = 0;
             std::vector<int32_t> sbuf((size_t) S, 0);
             hybrid_on = o.spec_hybrid && use_mtp && !req_df2 && req_sp.temperature == 0.0f && !gated_proposal && !pipe && o.batch == 0 && stages.empty() && !multi_gpu;
-            mtp.set_spec_hybrid(hybrid_on ? &hybrid : nullptr);
-            struct HybridReset { strata::core::MtpDrafter& m; ~HybridReset() { m.set_spec_hybrid(nullptr); } } hybrid_reset{mtp};
             if (hybrid_on) { hybrid.reset(); std::vector<int32_t> t(ids.begin(), ids.end()); hybrid.observe(t.data(), t.size()); }
             const bool sfx_on = o.suffix_draft > 0 || o.lookup_chain > 0;
             if (sfx_on) {
@@ -18762,7 +18760,7 @@ int main(int argc, char** argv) {
                         }
                     }
                 }
-                if (hybrid_on && !first_window && mtp.last_hybrid_count() > 0) T = std::min(T, mtp.last_hybrid_count() + 1);
+
                 if (dfr_lookup) {   // the lookup window chosen before the draft (the draft was skipped)
                     sfx.propose(S_look - 1, sbuf.data());
                     T = dfr_T; from_sfx = true; sfx_match = dfr_match;
@@ -20545,7 +20543,6 @@ int main(int argc, char** argv) {
         strata::spec::SuffixDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
         strata::core::SpecHybrid hybrid(o.spec_ngram_window, 4096, size_t(o.max_context) + 4096);
         const bool hybrid_on = o.spec_hybrid && use_mtp && !spec_uses_df2 && !gated_proposal && o.batch == 0;
-        mtp.set_spec_hybrid(hybrid_on ? &hybrid : nullptr);
         strata::spec::DraftPolicy policy(o.spec);   // MTP or lookup window (see draft_policy.hpp)
         auto source_policy = policy;   // this generation's: committed outcomes only (observe_committed)
         strata::spec::DraftPolicy::ChainState chain_st;
@@ -20717,7 +20714,7 @@ int main(int argc, char** argv) {
                 T = strata::spec::choose_window(wr);
             }
             if (first_window) T = 1;
-            if (hybrid_on && !first_window && mtp.last_hybrid_count() > 0) T = std::min(T, mtp.last_hybrid_count() + 1);
+
             std::copy(dprob.begin(), dprob.begin() + (std::ptrdiff_t) o.spec, dwin.begin());
             if (!t_cycle.empty() && !first_window) T = t_cycle[(size_t) (rounds % (int64_t) t_cycle.size())];
             if (o.suffix_draft > 0 && !first_window) {

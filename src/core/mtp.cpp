@@ -1,6 +1,5 @@
 // src/core/mtp.cpp - see include/strata/core/mtp.hpp.
 #include "strata/core/mtp.hpp"
-#include "spec_hybrid.h"
 #include "strata/core/pin_budget.hpp"
 #include "strata/kernels/qsa_prompt_attn.hpp"
 #include "strata/core/coupled_draft.hpp"
@@ -1722,23 +1721,6 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     const OnDevice on_device(device_);
     if (T < 1 || T > max_t_ || a < 0 || a >= T) { err = "mtp: draft arguments out of range"; return false; }
     if (chain_live_) { err = "mtp: a pipelined chain is still in flight"; return false; }
-    last_hybrid_count_ = 0;
-    if (hybrid_ && !coupled_active_ && !chain_rule_ && min_p <= 0.0f && max_drafts_ > 0) {
-        int32_t cand[SpecHybrid::kMaxDrafts];
-        const int k = hybrid_->propose(std::min<int>(max_drafts_, SpecHybrid::kMaxDrafts), cand);
-        if (k > 0) {
-            const float* rows = (src_R_ != nullptr && src_R_ != window_R_) ? src_R_ : window_R_;
-            if (rows == nullptr) { err = "mtp: no window rows bound"; return false; }
-            // Catch up the committed rows, but do not launch the dense MTP draft chain.
-            if (!prefill(rows, tokens, a + 1, p, err, true)) return false;
-            for (int j=0; j<max_t_-1; ++j) { drafts[j] = j<k ? cand[j] : 0; if (probs) probs[j] = j<k ? 1.0f : 0.0f; }
-            if (n_drafts) *n_drafts = k;
-            if (result) *result = {0, 0};
-            last_hybrid_count_ = k;
-            ++rounds;
-            return true;
-        }
-    }
     // #783 PR-i (stuchapin909): the round runs for the cells up to the accepted row a (T = a + 1): the K/V of the rejected
     // rows is not caught up - no later read reaches a cell past the one being drafted and the next round writes it first
     if (!mtp_catchup_all()) T = a + 1;
@@ -1917,22 +1899,6 @@ bool MtpDrafter::draft_long(int T, const int32_t* tokens, int64_t p, int a, int3
         return false;
     }
     if (a < max_t_) return draft(std::min(T, max_t_), tokens, p, a, drafts, err, probs, min_p, n_drafts, result);
-    last_hybrid_count_ = 0;
-    if (hybrid_ && !coupled_active_ && !chain_rule_ && min_p <= 0.0f && max_drafts_ > 0) {
-        int32_t cand[SpecHybrid::kMaxDrafts];
-        const int k = hybrid_->propose(std::min<int>(max_drafts_, SpecHybrid::kMaxDrafts), cand);
-        if (k > 0) {
-            const float* rows = (src_R_ != nullptr && src_R_ != window_R_) ? src_R_ : window_R_;
-            if (rows == nullptr) { err = "mtp: no window rows bound"; return false; }
-            if (!prefill(rows, tokens, a + 1, p, err, true)) return false;
-            for (int j=0; j<max_t_-1; ++j) { drafts[j] = j<k ? cand[j] : 0; if (probs) probs[j] = j<k ? 1.0f : 0.0f; }
-            if (n_drafts) *n_drafts = k;
-            if (result) *result = {0, 0};
-            last_hybrid_count_ = k;
-            ++rounds;
-            return true;
-        }
-    }
     // the window's rows: the bound buffer, or the rows draft() would stage from
     const float* rows = (src_R_ != nullptr && src_R_ != window_R_) ? src_R_ : window_R_;
     if (rows == nullptr) { err = "mtp: no window rows bound"; return false; }

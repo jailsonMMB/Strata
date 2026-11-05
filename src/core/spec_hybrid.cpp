@@ -1,4 +1,4 @@
-#include "spec_hybrid.h"
+#include "strata/core/spec_hybrid.hpp"
 #include <algorithm>
 #include <cstring>
 #include <stdexcept>

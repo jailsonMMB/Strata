@@ -1,4 +1,4 @@
-#include "../../src/core/radix_cache.h"
+#include "strata/core/radix_cache.hpp"
 #include <cassert>
 #include <cstdio>
 #include <vector>

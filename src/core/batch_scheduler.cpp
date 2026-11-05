@@ -1,4 +1,4 @@
-#include "batch_scheduler.h"
+#include "strata/core/batch_scheduler.hpp"
 #include <algorithm>
 
 namespace strata::core {

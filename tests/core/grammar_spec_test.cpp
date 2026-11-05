@@ -1,4 +1,4 @@
-#include "../../src/core/spec_hybrid.h"
+#include "strata/core/spec_hybrid.hpp"
 
 #include <cassert>
 #include <cmath>

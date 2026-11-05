@@ -22,5 +22,6 @@ inline bool ccx_shard_plan(const std::vector<int>& cpus, const std::vector<int>&
     }
     return count[0] == 3 && count[1] == 3;
 }
+// Initial affinity preference based on expert ID hash; pool dynamically rebalances to prevent skew.
 inline int ccx_owner(int expert_id) { return expert_id & 1; }
 }  // namespace strata::kernels::cpu
