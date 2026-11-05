@@ -11,11 +11,40 @@ uint64_t hash_key(const int32_t* key, int n) {
     return h ? h : 1;
 }
 }
+
+SyntaxBitmask::SyntaxBitmask() {
+    words.fill(~0ull);
+}
+
+void SyntaxBitmask::apply_mask(float* logits, int vocab_size, int brace_depth, bool in_string) const {
+    if (logits == nullptr || in_string || brace_depth <= 0) return;
+    const size_t n = std::min<size_t>((size_t) vocab_size, kBits);
+    const size_t n_words = (n + 63) / 64;
+
+    for (size_t w = 0; w < n_words; ++w) {
+        const uint64_t mask = words[w];
+        if (mask == ~0ull) continue; // All 64 tokens valid
+        const size_t base = w * 64;
+        if (mask == 0ull) {
+            const size_t limit = std::min<size_t>(base + 64, n);
+            for (size_t i = base; i < limit; ++i) {
+                logits[i] = -1e10f;
+            }
+            continue;
+        }
+        for (int b = 0; b < 64 && (base + b) < n; ++b) {
+            if ((mask & (1ull << b)) == 0) {
+                logits[base + b] = -1e10f;
+            }
+        }
+    }
+}
+
 SpecHybrid::SpecHybrid(int window,size_t slots,size_t history):window_(window),history_cap_(history),ring_(history,0) {
     if(window<2||window>4||history<8)throw std::invalid_argument("spec hybrid window/history");
     size_t cap=1;while(cap<slots)cap<<=1;table_.resize(std::max<size_t>(16,cap));mask_=table_.size()-1;
 }
-void SpecHybrid::reset(){std::fill(table_.begin(),table_.end(),Slot{});history_size_=history_head_=clock_=0;last_order_=0;}
+void SpecHybrid::reset(){std::fill(table_.begin(),table_.end(),Slot{});history_size_=history_head_=clock_=0;last_order_=0;tracker_.reset();}
 bool SpecHybrid::matches(const Slot& s,const int32_t* key)const{for(int i=0;i<s.order;++i)if(s.key[i]!=key[i])return false;return true;}
 SpecHybrid::Slot* SpecHybrid::slot_for(const int32_t* key,int order,bool insert){
     const uint64_t h=hash_key(key,order);size_t p=h&mask_;
@@ -25,6 +54,9 @@ SpecHybrid::Slot* SpecHybrid::slot_for(const int32_t* key,int order,bool insert)
 void SpecHybrid::observe(const int32_t* tokens,size_t n){
     for(size_t j=0;j<n;++j){
         const int32_t tok=tokens[j];
+        if (tok >= 0 && tok < 128) {
+            tracker_.observe_char((char) tok);
+        }
         for(int order=2;order<=4;++order){
             if(history_size_<size_t(order))continue;
             std::array<int32_t,4> key{};for(int k=0;k<order;++k)key[k]=at(history_size_-order+k);
@@ -51,7 +83,12 @@ int SpecHybrid::propose(int max_drafts,int32_t* out){
         for(int k=0;k<order;++k)key[k]=at(history_size_-order+k);
         Slot* s=slot_for(key.data(),order,false);if(!s||s->count<2||!s->choices)continue;
         int best=0;uint32_t total=0;for(uint8_t i=0;i<s->choices;++i){total+=s->frequency[i];if(s->frequency[i]>s->frequency[best])best=i;}
-        if(s->frequency[best]*2>total){chosen=s;out[0]=s->next[best];last_order_=order;break;}
+        if(s->frequency[best]*2>total){
+            if (grammar_guidance_ && tracker_.should_filter() && !bitmask_.is_valid(s->next[best])) {
+                continue; // Skip syntax-violating candidate under active delimiter scope
+            }
+            chosen=s;out[0]=s->next[best];last_order_=order;break;
+        }
     }
     if(!chosen){++misses_;return 0;}
     int n=1;
@@ -61,7 +98,14 @@ int SpecHybrid::propose(int max_drafts,int32_t* out){
         if(pos+order+limit>history_size_)continue;
         bool same=true;for(int k=0;k<order&&same;++k)same=at(pos+k)==key[k];
         if(!same||at(pos+order)!=out[0])continue;
-        n=1;while(n<limit&&pos+order+n<history_size_){out[n]=at(pos+order+n);++n;}
+        n=1;
+        while(n<limit&&pos+order+n<history_size_){
+            const int32_t cand = at(pos+order+n);
+            if (grammar_guidance_ && tracker_.should_filter() && !bitmask_.is_valid(cand)) {
+                break; // Stop extension before invalid token
+            }
+            out[n]=cand;++n;
+        }
         if(n==limit)break;
     }
     ++hits_;return n;

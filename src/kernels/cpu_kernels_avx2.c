@@ -171,32 +171,97 @@ static inline float strata_hsum256_ps(__m256 v) {
     return _mm_cvtss_f32(s);
 }
 
-void moe_gemv_iq2_xs_avx2(const void* restrict weights,
-                          const float* restrict x,
-                          float* restrict y,
-                          int rows,
-                          int cols) {
+static inline float strata_hmax256_ps(__m256 v) {
+    __m128 lo = _mm256_castps256_ps128(v);
+    __m128 hi = _mm256_extractf128_ps(v, 1);
+    __m128 m = _mm_max_ps(lo, hi);
+    m = _mm_max_ps(m, _mm_movehl_ps(m, m));
+    m = _mm_max_ss(m, _mm_shuffle_ps(m, m, 1));
+    return _mm_cvtss_f32(m);
+}
+
+void quantize_row_q8_0_avx2(const float* restrict x,
+                            void* restrict q8_out,
+                            int cols) {
+    strata_q8_block_t* y = (strata_q8_block_t*) q8_out;
+    const int nb = cols / 32;
+    const __m256 sign_mask = _mm256_set1_ps(-0.0f);
+    const __m256i perm = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+    const __m256i min_val = _mm256_set1_epi32(-127);
+    const __m256i max_val = _mm256_set1_epi32(127);
+
+    for (int i = 0; i < nb; ++i) {
+        const float* xi = x + (size_t) i * 32;
+        __m256 v0 = _mm256_loadu_ps(xi + 0);
+        __m256 v1 = _mm256_loadu_ps(xi + 8);
+        __m256 v2 = _mm256_loadu_ps(xi + 16);
+        __m256 v3 = _mm256_loadu_ps(xi + 24);
+
+        __m256 a0 = _mm256_andnot_ps(sign_mask, v0);
+        __m256 a1 = _mm256_andnot_ps(sign_mask, v1);
+        __m256 a2 = _mm256_andnot_ps(sign_mask, v2);
+        __m256 a3 = _mm256_andnot_ps(sign_mask, v3);
+
+        __m256 m01 = _mm256_max_ps(a0, a1);
+        __m256 m23 = _mm256_max_ps(a2, a3);
+        __m256 m_all = _mm256_max_ps(m01, m23);
+        const float amax = strata_hmax256_ps(m_all);
+
+        if (amax <= 0.0f) {
+            y[i].d = 0.0f;
+            memset(y[i].qs, 0, 32);
+            continue;
+        }
+
+        const float d = amax / 127.0f;
+        const float id = 127.0f / amax;
+        const __m256 vid = _mm256_set1_ps(id);
+        y[i].d = d;
+
+        __m256 q0 = _mm256_mul_ps(v0, vid);
+        __m256 q1 = _mm256_mul_ps(v1, vid);
+        __m256 q2 = _mm256_mul_ps(v2, vid);
+        __m256 q3 = _mm256_mul_ps(v3, vid);
+
+        __m256i i0 = _mm256_cvtps_epi32(_mm256_round_ps(q0, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+        __m256i i1 = _mm256_cvtps_epi32(_mm256_round_ps(q1, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+        __m256i i2 = _mm256_cvtps_epi32(_mm256_round_ps(q2, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+        __m256i i3 = _mm256_cvtps_epi32(_mm256_round_ps(q3, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+
+        /* Clamp strictly to [-127, 127] to guarantee -(-128) overflow never happens */
+        i0 = _mm256_max_epi32(min_val, _mm256_min_epi32(max_val, i0));
+        i1 = _mm256_max_epi32(min_val, _mm256_min_epi32(max_val, i1));
+        i2 = _mm256_max_epi32(min_val, _mm256_min_epi32(max_val, i2));
+        i3 = _mm256_max_epi32(min_val, _mm256_min_epi32(max_val, i3));
+
+        __m256i p16a = _mm256_packs_epi32(i0, i1);
+        __m256i p16b = _mm256_packs_epi32(i2, i3);
+        __m256i p8 = _mm256_permutevar8x32_epi32(_mm256_packs_epi16(p16a, p16b), perm);
+
+        _mm256_storeu_si256((__m256i*) y[i].qs, p8);
+    }
+}
+
+void moe_gemv_iq2_xs_q8_avx2(const void* restrict weights,
+                             const void* restrict q8_x,
+                             float* restrict y,
+                             int rows,
+                             int cols) {
     const uint8_t* w = (const uint8_t*) weights;
+    const strata_q8_block_t* q8_blocks = (const strata_q8_block_t*) q8_x;
     const int blocks_per_row = cols / STRATA_IQ2_XS_QK;
     const size_t row_bytes = (size_t) blocks_per_row * STRATA_IQ2_XS_BLOCK_BYTES;
+    const __m256i ones_16 = _mm256_set1_epi16(1);
     int r;
 
-    assert(rows > 0);
-    assert(cols > 0 && (cols % STRATA_IQ2_XS_QK) == 0);
-    assert(weights != NULL && x != NULL && y != NULL);
-
-    /* A partial IQ2_XS block has no defined storage layout: refuse it. */
     if (rows <= 0 || cols <= 0 || (cols % STRATA_IQ2_XS_QK) != 0 ||
-        weights == NULL || x == NULL || y == NULL) {
+        weights == NULL || q8_x == NULL || y == NULL) {
         return;
     }
 
     for (r = 0; r < rows; ++r) {
         const uint8_t* row = w + (size_t) r * row_bytes;
-        __m256 acc0 = _mm256_setzero_ps();
-        __m256 acc1 = _mm256_setzero_ps();
-        __m256 acc2 = _mm256_setzero_ps();
-        __m256 acc3 = _mm256_setzero_ps();
+        float row_sum = 0.0f;
         int b;
 
         if (r + 1 < rows) {
@@ -205,36 +270,82 @@ void moe_gemv_iq2_xs_avx2(const void* restrict weights,
 
         for (b = 0; b < blocks_per_row; ++b) {
             const uint8_t* block = row + (size_t) b * STRATA_IQ2_XS_BLOCK_BYTES;
-            const float* xb = x + (size_t) b * STRATA_IQ2_XS_QK;
             const float d = strata_fp16_to_fp32(strata_load_u16(block));
+            const float d_k = d * STRATA_IQ2_XS_K;
+            const size_t q8_base = (size_t) b * 8;
             int j;
 
             for (j = 0; j < 4; ++j) {
+                const uint8_t* q = block + 2 + 16 * j;
+                uint16_t v[8];
                 int half;
-                for (half = 0; half < 2; ++half) {
-                    __m256 scale_lo, scale_hi;
-                    const int column = 64 * j + 32 * half;
-                    const __m256i sw = strata_iq2_xs_signed_32(
-                        block, j, half, d, &scale_lo, &scale_hi);
-                    const __m128i lo = _mm256_castsi256_si128(sw);
-                    const __m128i hi = _mm256_extracti128_si256(sw, 1);
+                memcpy(v, q, sizeof(v));
 
-                    acc0 = strata_dot8_i8(lo, xb + column, scale_lo, acc0);
-                    acc1 = strata_dot8_i8(_mm_srli_si128(lo, 8),
-                                          xb + column + 8, scale_lo, acc1);
-                    acc2 = strata_dot8_i8(hi, xb + column + 16, scale_hi, acc2);
-                    acc3 = strata_dot8_i8(_mm_srli_si128(hi, 8),
-                                          xb + column + 24, scale_hi, acc3);
+                for (half = 0; half < 2; ++half) {
+                    const int o = 4 * half;
+                    const strata_q8_block_t* q8 = &q8_blocks[q8_base + 2 * j + half];
+                    uint32_t signs = 0;
+                    int l;
+
+                    const __m256i grid = _mm256_set_epi64x(
+                        (long long) iq2xs_grid[v[o + 3] & 511],
+                        (long long) iq2xs_grid[v[o + 2] & 511],
+                        (long long) iq2xs_grid[v[o + 1] & 511],
+                        (long long) iq2xs_grid[v[o + 0] & 511]);
+
+                    for (l = 0; l < 4; ++l) {
+                        signs |= (uint32_t) ksigns_iq2xs[v[o + l] >> 9] << (8 * l);
+                    }
+
+                    /* Safeguard 2: strata_signs_32 yields strictly +1 or -1 (never zero) */
+                    const __m256i sign_vec = strata_signs_32(signs);
+                    const __m256i x_raw = _mm256_loadu_si256((const __m256i*) q8->qs);
+                    const __m256i x_signed = _mm256_sign_epi8(x_raw, sign_vec);
+
+                    /* Safeguard 1: grid uint8 [0..15], x_signed int8 [-127..127]. Max pair sum 3810 <= 32767 */
+                    const __m256i dot_16 = _mm256_maddubs_epi16(grid, x_signed);
+                    const __m256i dot_32 = _mm256_madd_epi16(dot_16, ones_16);
+
+                    /* Low lane = first 16 values, High lane = last 16 values */
+                    __m128i lo = _mm256_castsi256_si128(dot_32);
+                    __m128i hi = _mm256_extracti128_si256(dot_32, 1);
+
+                    lo = _mm_add_epi32(lo, _mm_shuffle_epi32(lo, 0x4E));
+                    lo = _mm_add_epi32(lo, _mm_shuffle_epi32(lo, 0xB1));
+                    const int sum_lo = _mm_cvtsi128_si32(lo);
+
+                    hi = _mm_add_epi32(hi, _mm_shuffle_epi32(hi, 0x4E));
+                    hi = _mm_add_epi32(hi, _mm_shuffle_epi32(hi, 0xB1));
+                    const int sum_hi = _mm_cvtsi128_si32(hi);
+
+                    const uint8_t packed_scale = block[66 + 2 * j + half];
+                    const int S_lo = 2 * (int) (packed_scale & 15u) + 1;
+                    const int S_hi = 2 * (int) (packed_scale >> 4) + 1;
+
+                    const float half_val = (d_k * q8->d) * (float) (S_lo * sum_lo + S_hi * sum_hi);
+                    row_sum += half_val;
                 }
             }
         }
-
-        acc0 = _mm256_add_ps(acc0, acc1);
-        acc2 = _mm256_add_ps(acc2, acc3);
-        y[r] = strata_hsum256_ps(_mm256_add_ps(acc0, acc2));
+        y[r] = row_sum;
     }
 
     _mm256_zeroupper();
+}
+
+void moe_gemv_iq2_xs_avx2(const void* restrict weights,
+                          const float* restrict x,
+                          float* restrict y,
+                          int rows,
+                          int cols) {
+    if (rows <= 0 || cols <= 0 || (cols % STRATA_IQ2_XS_QK) != 0 ||
+        weights == NULL || x == NULL || y == NULL) {
+        return;
+    }
+    const int blocks_32 = cols / 32;
+    strata_q8_block_t q8_x[blocks_32];
+    quantize_row_q8_0_avx2(x, q8_x, cols);
+    moe_gemv_iq2_xs_q8_avx2(weights, q8_x, y, rows, cols);
 }
 
 /* Sprint 5: IQ4_NL/Q4_0 fused dequant+GEMV. Values never leave YMM registers. */
