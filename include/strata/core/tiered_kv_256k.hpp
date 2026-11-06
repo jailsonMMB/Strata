@@ -7,26 +7,26 @@
 
 namespace strata::core {
 
-// Constantes Arquiteturais para 256K no Qwen3.8-Flash-Next
-constexpr int kMaxSeqLen256K      = 262144; // 256K tokens exatos
-constexpr int kPageTokens         = 64;     // 64 tokens por página (alinhado ao warp/cacheline)
-constexpr int kMaxPages256K       = kMaxSeqLen256K / kPageTokens; // 4.096 páginas totais
-constexpr int kVramActivePages    = 64;     // 64 páginas na VRAM = 4.096 tokens quentes (~350 MiB)
-constexpr int kSinkPages          = 2;      // 128 tokens iniciais sempre cravados na VRAM
-constexpr int kLocalWindowPages   = 32;     // Últimos 2.048 tokens sempre cravados na VRAM
-constexpr int kQuestTopKPages     = 30;     // 30 páginas históricas selecionadas pelo Quest por passo
-constexpr int kHeadDim            = 128;    // Dimensão padrão por cabeça GQA do Qwen
+// Architectural constants for 256K context on Qwen3.8-Flash-Next
+constexpr int kMaxSeqLen256K      = 262144; // Exact 256K token context window
+constexpr int kPageTokens         = 64;     // 64 tokens per page (aligned with warp/cacheline)
+constexpr int kMaxPages256K       = kMaxSeqLen256K / kPageTokens; // 4,096 total pages
+constexpr int kVramActivePages    = 64;     // 64 active pages in VRAM = 4,096 hot tokens (~350 MiB)
+constexpr int kSinkPages          = 2;      // 128 initial tokens pinned in VRAM (attention sinks)
+constexpr int kLocalWindowPages   = 32;     // Last 2,048 tokens pinned in VRAM (sliding window)
+constexpr int kQuestTopKPages     = 30;     // 30 historical pages selected by Quest per step
+constexpr int kHeadDim            = 128;    // Standard head dimension for GQA
 
-// Bloco K4V2 Compactado para 1 Cabeça em 1 Página (64 tokens x 128 dim = 6.784 bytes)
+// Compact K4V2 block for 1 head in 1 page (64 tokens x 128 dim = 6,784 bytes)
 struct alignas(64) KVPageK4V2 {
-    __half   k_ch_scale[kHeadDim];                // Escala por canal (absorve outliers do RoPE)
-    __half   k_ch_min[kHeadDim];                  // Offset mínimo por canal
-    uint8_t  k_quant[kPageTokens * kHeadDim / 2]; // 4 bits por coordenada de Key (4.096 bytes)
-    __half   v_tok_scale[kPageTokens];            // Escala RMS por token para Value
-    uint8_t  v_quant[kPageTokens * kHeadDim / 4]; // 2 bits não-lineares por Value (2.048 bytes)
+    __half   k_ch_scale[kHeadDim];                // Per-channel scale (absorbs RoPE outliers)
+    __half   k_ch_min[kHeadDim];                  // Per-channel minimum offset
+    uint8_t  k_quant[kPageTokens * kHeadDim / 2]; // 4-bit per Key coordinate (4,096 bytes)
+    __half   v_tok_scale[kPageTokens];            // Per-token RMS scale for Value
+    uint8_t  v_quant[kPageTokens * kHeadDim / 4]; // 2-bit non-linear centroids for Value (2,048 bytes)
 };
 
-// Assinatura Quest residente 100% na VRAM (~12 MiB para todas as 4.096 páginas)
+// Quest bounding box resident in VRAM (~12 MiB total for all 4,096 pages)
 struct alignas(16) QuestPageBBox {
     __half k_min[kHeadDim];
     __half k_max[kHeadDim];
@@ -39,35 +39,49 @@ public:
 
     bool init();
 
-    // Registra uma nova página fechada de 64 tokens: grava o BBox na VRAM e espelha a página K4V2 na DDR4
+    // Commits a newly finalized 64-token page: updates VRAM BBox and mirrors K4V2 to DDR4
     void commit_page_async(int layer, int page_idx, const KVPageK4V2* d_new_page,
                            const QuestPageBBox* d_new_bbox, cudaStream_t dma_stream);
 
-    // Avalia os 4.096 BBoxes na GPU e transfere via DMA assíncrono apenas as páginas ausentes no pool ativo
+    // Evaluates 4,096 BBoxes on GPU and initiates async DMA transfers for missing pages
     void prepare_attention_window_async(int layer, int current_seq_len, const float* d_query,
                                         cudaStream_t compute_stream, cudaStream_t dma_stream);
 
+    // Asynchronously mounts a contiguous block of DDR4/NVMe pages into [vram_slot_dst...],
+    // assigning logical token position 'assigned_logical_token_pos' for Late-RoPE
+    void mount_graph_pages_async(
+        int layer,
+        int vram_slot_dst,
+        int ddr4_page_start,
+        int page_count,
+        int assigned_logical_token_pos,
+        cudaStream_t dma_stream
+    );
+
     const KVPageK4V2* vram_active_pool(int layer) const { return d_vram_pool_[layer]; }
     const int32_t* vram_active_page_ids(int layer) const { return d_active_page_table_[layer]; }
+    const int32_t* vram_active_logical_pos(int layer) const { return d_active_logical_pos_[layer]; }
     const QuestPageBBox* quest_bboxes(int layer) const { return d_quest_bboxes_[layer]; }
 
 private:
     int num_layers_;
     int num_kv_heads_;
 
-    // Nível 1 (VRAM GDDR7): 64 páginas ativas por camada (~350 MiB totais)
+    // Tier 1 (VRAM): 64 active pages per layer (~350 MiB total)
     std::vector<KVPageK4V2*> d_vram_pool_;
-    // Índice Quest na VRAM: 4.096 caixas delimitadoras [K_min, K_max] por camada (~12 MiB)
+    // Quest index in VRAM: 4,096 bounding boxes [K_min, K_max] per layer (~12 MiB)
     std::vector<QuestPageBBox*> d_quest_bboxes_;
-    // IDs das 64 páginas atualmente carregadas nos slots da VRAM
+    // IDs of the 64 pages currently loaded into VRAM slots
     std::vector<int32_t*> d_active_page_table_;
-    // Espelho em Host dos IDs residentes na VRAM para evitar transferências duplicadas no PCIe
+    // Initial logical token position assigned to each of the 64 active VRAM slots (Late-RoPE)
+    std::vector<int32_t*> d_active_logical_pos_;
+    // Host-side tracker of resident VRAM slot page IDs to prevent duplicate PCIe DMA transfers
     std::vector<std::vector<int32_t>> h_active_page_tracker_;
 
-    // Nível 2 (Host DDR4 64 GB Page-Locked): Todas as 4.096 páginas (256K tokens = ~10.42 GiB)
+    // Tier 2 (Host DDR4 page-locked): All 4,096 pages (256K tokens = ~10.42 GiB)
     std::vector<KVPageK4V2*> h_pinned_ddr4_pool_;
 
-    // Buffers de pontuação do seletor Quest
+    // Scoring buffers for Quest selection
     float* d_page_scores_ = nullptr;
     float* h_page_scores_pinned_ = nullptr;
 };

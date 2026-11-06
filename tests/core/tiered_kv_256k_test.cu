@@ -64,7 +64,7 @@ int main() {
 
     float max_ch0 = __half2float(h_bbox[0].k_max[0]);
     float min_ch0 = __half2float(h_bbox[0].k_min[0]);
-    std::printf("  Canal 0 Outlier Range: [%.3f, %.3f]\n", min_ch0, max_ch0);
+    std::printf("  Channel 0 Outlier Range: [%.3f, %.3f]\n", min_ch0, max_ch0);
     if (max_ch0 <= 10.0f || min_ch0 >= -10.0f) {
         std::printf("FAILED: Outlier range [%.3f, %.3f] does not match expectation!\n", min_ch0, max_ch0);
         return 1;

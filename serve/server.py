@@ -1639,6 +1639,50 @@ class StrataEngine:
             if time.time() > deadline:
                 raise EngineDied("the engine did not answer the VRAM command")
 
+    def mount_kv(self, blocks: list, timeout: float = 10.0) -> dict:
+        """Mounts pre-computed Graph-KV pages into VRAM with exclusive engine control."""
+        with self._exclusive_control():
+            return self._mount_kv(blocks, timeout)
+
+    def _mount_kv(self, blocks: list, timeout: float = 10.0) -> dict:
+        """Sends MOUNT_KV command to the engine and waits for MOUNT_OK.
+        blocks: list of (ddr4_page_start, page_count, logical_token_pos) tuples or lists.
+        """
+        if not self.alive():
+            raise EngineDied("the engine is not running")
+        if not blocks:
+            return {"vram_slots": 0, "tokens_mounted": 0}
+        parts = [f"MOUNT_KV {len(blocks)}"]
+        for item in blocks:
+            if isinstance(item, (list, tuple)) and len(item) == 3:
+                parts.append(f"{int(item[0])}:{int(item[1])}:{int(item[2])}")
+            elif isinstance(item, str):
+                parts.append(item)
+        cmd = " ".join(parts)
+        btrace("send>", cmd[:60])
+        with self.wlock:
+            self.proc.stdin.write(cmd + "\n")
+            self.proc.stdin.flush()
+        deadline = time.time() + timeout
+        while True:
+            try:
+                line = self.lines.get(timeout=max(0.1, deadline - time.time()))
+            except queue.Empty:
+                raise EngineDied("the engine did not answer the MOUNT_KV command") from None
+            if line is None:
+                raise EngineDied("the engine ended")
+            line = line.strip()
+            if line.startswith("ERR"):
+                raise ValueError(line[4:].strip() or "the engine refused the MOUNT_KV command")
+            if line.startswith("MOUNT_OK"):
+                out = {}
+                for kv in line.split()[1:]:
+                    k, _, v = kv.partition("=")
+                    out[k] = int(v) if v.lstrip("-").isdigit() else v
+                return out
+            if time.time() > deadline:
+                raise EngineDied("the engine did not answer the MOUNT_KV command")
+
     def pen_from_key(self, orig_len: int, prompt_len: int) -> str:
         """` pen_from=N` for a leg that continues a request (prompt + what it generated): where the reply began, Strata's penalty window start. The all-cards split engine
         (sFNX) counts its penalty window over the last penalty_last_n tokens of the whole context, so the continued prompt gives it the same window and the engine refuses the

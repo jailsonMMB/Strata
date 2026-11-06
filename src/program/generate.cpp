@@ -86,6 +86,9 @@
 #include "strata/core/shm_ipc.hpp"
 #include "strata/core/snap_kv.hpp"
 #include "strata/core/early_exit.hpp"
+#if defined(STRATA_HAS_TIERED_KV_256K)
+#include "strata/core/tiered_kv_256k.hpp"
+#endif
 
 static strata::core::StrataShmIPC* g_active_shm_ipc = nullptr;
 static strata::core::SnapKVSelector* g_active_snap_kv = nullptr;
@@ -15278,6 +15281,74 @@ int main(int argc, char** argv) {
                 if (!verr.empty()) std::printf("ERR %s\n", verr.c_str());
                 std::fflush(stdout);
                 continue;
+            }
+            if (line.rfind("MOUNT_KV ", 0) == 0) {
+#if defined(STRATA_HAS_TIERED_KV_256K)
+                static std::unique_ptr<strata::core::TieredKVCache256K> tiered_kv_256k;
+                static cudaStream_t dma_transfer_stream = nullptr;
+                if (!tiered_kv_256k) {
+                    if (dma_transfer_stream == nullptr) {
+                        cudaStreamCreateWithFlags(&dma_transfer_stream, cudaStreamNonBlocking);
+                    }
+                    tiered_kv_256k = std::make_unique<strata::core::TieredKVCache256K>((int) g.n_layers, (int) g.n_head_kv);
+                    if (!tiered_kv_256k->init()) {
+                        std::printf("ERR MOUNT_KV: failed to initialize TieredKVCache256K\n");
+                        std::fflush(stdout);
+                        continue;
+                    }
+                }
+
+                const char* p = line.c_str() + 9;
+                char* endp = nullptr;
+                int num_blocks = static_cast<int>(std::strtol(p, &endp, 10));
+                p = endp;
+
+                int vram_slot_cursor = strata::core::kSinkPages; // Start at slot 2 (after the 128 sink tokens)
+                const int max_graph_slot = strata::core::kVramActivePages - strata::core::kLocalWindowPages; // Upper bound: slot 32
+                int total_mounted_tokens = 0;
+
+                for (int i = 0; i < num_blocks && vram_slot_cursor < max_graph_slot; ++i) {
+                    while (*p == ' ') ++p;
+                    if (*p == '\0') break;
+                    int ddr4_page_start = static_cast<int>(std::strtol(p, &endp, 10));
+                    if (*endp == ':') ++endp;
+                    int page_count = static_cast<int>(std::strtol(endp, &endp, 10));
+                    if (*endp == ':') ++endp;
+                    int logical_pos = static_cast<int>(std::strtol(endp, &endp, 10));
+                    p = endp;
+
+                    if (vram_slot_cursor + page_count > max_graph_slot) {
+                        page_count = max_graph_slot - vram_slot_cursor;
+                    }
+
+                    if (page_count > 0) {
+                        for (int l = 0; l < g.n_layers; ++l) {
+                            tiered_kv_256k->mount_graph_pages_async(
+                                l,
+                                vram_slot_cursor,
+                                ddr4_page_start,
+                                page_count,
+                                logical_pos,
+                                dma_transfer_stream
+                            );
+                        }
+                        vram_slot_cursor += page_count;
+                        total_mounted_tokens += page_count * strata::core::kPageTokens;
+                    }
+                }
+
+                // Synchronize async DMA stream before returning confirmation
+                if (dma_transfer_stream != nullptr) {
+                    cudaStreamSynchronize(dma_transfer_stream);
+                }
+                std::printf("MOUNT_OK vram_slots=%d tokens_mounted=%d\n", vram_slot_cursor, total_mounted_tokens);
+                std::fflush(stdout);
+                continue;
+#else
+                std::printf("ERR MOUNT_KV: compiled without STRATA_HAS_TIERED_KV_256K\n");
+                std::fflush(stdout);
+                continue;
+#endif
             }
             // a command may touch the expert cache (a request lends slots, a K/V growth moves them, a session restore
             // quiesces it): a round of the asynchronous tier that the batch windows left in flight lands first

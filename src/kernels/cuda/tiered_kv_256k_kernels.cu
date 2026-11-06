@@ -1,4 +1,5 @@
 #include "strata/core/tiered_kv_256k.hpp"
+#include "graph_kv_rope.cuh"
 #include <math_constants.h>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -7,36 +8,36 @@ namespace strata::kernels {
 
 using namespace strata::core;
 
-// Centroides ótimos da distribuição Normal N(0,1) para quantização de 2 bits do Value
+// Optimal Normal distribution N(0,1) centroids for 2-bit Value quantization
 __constant__ float c_v2_centroids[4] = {-1.510f, -0.453f, 0.453f, 1.510f};
 
 // ============================================================================
-// 1. Kernel YaRN / NTK-by-Parts Dinâmico para 256.000 Tokens
+// 1. Dynamic YaRN / NTK-by-Parts Kernel for 256,000 Tokens
 // ============================================================================
 __global__ void yarn_rope_256k_kernel(
     float* __restrict__ q_or_k,
     int num_heads,
     int token_pos,
-    float base_theta,       // ex: 1000000.0f no Qwen3.8
-    int orig_max_ctx        // ex: 32768
+    float base_theta,       // e.g. 1000000.0f in Qwen3.8
+    int orig_max_ctx        // e.g. 32768
 ) {
     const int head_idx = blockIdx.x;
-    const int pair_idx = threadIdx.x; // 0..63 (pares de dimensão para kHeadDim = 128)
+    const int pair_idx = threadIdx.x; // 0..63 (dimension pairs for kHeadDim = 128)
     if (head_idx >= num_heads || pair_idx >= kHeadDim / 2) return;
 
-    const float scale_s = 8.0f; // Expansão 32K -> 256K (8x)
-    const float alpha   = 1.0f; // Limiar de alta frequência (preserva sintaxe local)
-    const float beta    = 32.0f;// Limiar de baixa frequência (interpola longo alcance)
+    const float scale_s = 8.0f; // 32K -> 256K expansion (8x)
+    const float alpha   = 1.0f; // High-frequency threshold (preserves local syntax)
+    const float beta    = 32.0f;// Low-frequency threshold (interpolates long-range)
 
     float freq = 1.0f / powf(base_theta, (float)(2 * pair_idx) / (float)kHeadDim);
     float wavelength = 2.0f * CUDART_PI_F / freq;
     float r = (float)orig_max_ctx / wavelength;
 
-    // Fator de rampa suave NTK-by-Parts
+    // Smooth NTK-by-Parts ramp factor
     float gamma = fminf(1.0f, fmaxf(0.0f, (r - alpha) / (beta - alpha)));
     float yarn_freq = (1.0f - gamma) * (freq / scale_s) + gamma * freq;
 
-    // Correção de temperatura de atenção mscale = 0.1 * ln(s) + 1.0
+    // Attention temperature correction mscale = 0.1 * ln(s) + 1.0
     float mscale = (token_pos > orig_max_ctx) ? (0.1f * logf(scale_s) + 1.0f) : 1.0f;
 
     float angle = (float)token_pos * yarn_freq;
@@ -52,20 +53,21 @@ __global__ void yarn_rope_256k_kernel(
 }
 
 // ============================================================================
-// 2. Kernel Quest: Filtra 4.096 Páginas (256K tokens) na VRAM em < 0.04 ms
+// 2. Quest Kernel: Filters 4,096 Pages (256K tokens) in VRAM in < 0.04 ms
 // ============================================================================
 __global__ void quest_score_pages_kernel(
     const float* __restrict__ q_vec,              // [num_kv_heads, kHeadDim]
     const QuestPageBBox* __restrict__ bboxes,     // [num_pages, num_kv_heads]
     float* __restrict__ out_page_scores,          // [num_pages]
     int num_active_pages,
-    int num_kv_heads
+    int num_kv_heads,
+    int num_graph_pinned_pages = 0
 ) {
     const int page_id = blockIdx.x;
     if (page_id >= num_active_pages) return;
 
-    // Páginas Sink e Janela Local já têm vaga cativa na VRAM
-    if (page_id < kSinkPages || page_id >= (num_active_pages - kLocalWindowPages)) {
+    // Sink pages, Graph-KV pinned pages, and local window pages are permanently pinned in VRAM
+    if (page_id < (kSinkPages + num_graph_pinned_pages) || page_id >= (num_active_pages - kLocalWindowPages)) {
         if (threadIdx.x == 0) out_page_scores[page_id] = -1e20f;
         return;
     }
@@ -81,7 +83,7 @@ __global__ void quest_score_pages_kernel(
         thread_bound_sum += fmaxf(q_val * k_max, q_val * k_min);
     }
 
-    // Redução Warp-Shuffle em 128 threads (4 warps)
+    // Warp-shuffle reduction across 128 threads (4 warps)
     for (int offset = 16; offset > 0; offset >>= 1) {
         thread_bound_sum += __shfl_down_sync(0xffffffff, thread_bound_sum, offset);
     }
@@ -96,7 +98,7 @@ __global__ void quest_score_pages_kernel(
 }
 
 // ============================================================================
-// 3. Descompressor On-The-Fly K4V2 nos Registradores (Zero Shared Memory)
+// 3. On-The-Fly K4V2 Decompressor in Registers (Zero Shared Memory)
 // ============================================================================
 __device__ __forceinline__ void dequant_k4v2_token(
     const KVPageK4V2& page,
@@ -105,7 +107,7 @@ __device__ __forceinline__ void dequant_k4v2_token(
     float& out_k,
     float& out_v
 ) {
-    // 1. Reconstrução da Key de 4 bits (Per-Channel Scale + Min)
+    // 1. 4-bit Key reconstruction (Per-Channel Scale + Min)
     const int k_byte_idx = (token_in_page * kHeadDim + dim_idx) >> 1;
     const uint8_t k_packed = __ldg(&page.k_quant[k_byte_idx]);
     const uint8_t k_nibble = (dim_idx & 1) ? (k_packed >> 4) : (k_packed & 0x0F);
@@ -114,7 +116,7 @@ __device__ __forceinline__ void dequant_k4v2_token(
     const float k_min   = __half2float(__ldg(&page.k_ch_min[dim_idx]));
     out_k = (float)k_nibble * k_scale + k_min;
 
-    // 2. Reconstrução do Value de 2 bits via Lookup de Centroides Normais
+    // 2. 2-bit Value reconstruction via Normal centroid lookup
     const int v_byte_idx = (token_in_page * kHeadDim + dim_idx) >> 2;
     const int v_shift    = (dim_idx & 3) * 2;
     const uint8_t v_2bit = (__ldg(&page.v_quant[v_byte_idx]) >> v_shift) & 0x03;
@@ -124,7 +126,7 @@ __device__ __forceinline__ void dequant_k4v2_token(
 }
 
 // ============================================================================
-// 4. Compactador de Página FP32 -> K4V2 + Gerador Automático de BBox Quest
+// 4. FP32 -> K4V2 Page Compressor + Quest BBox Generator
 // ============================================================================
 __global__ void pack_page_k4v2_and_bbox_kernel(
     const float* __restrict__ k_in, // [num_kv_heads, kPageTokens, kHeadDim]
@@ -141,7 +143,7 @@ __global__ void pack_page_k4v2_and_bbox_kernel(
     KVPageK4V2& page = out_page[head_id];
     QuestPageBBox& bbox = out_bbox[head_id];
 
-    // Passo A: Encontra K_min e K_max ao longo dos 64 tokens para o canal 'd'
+    // Step A: Find K_min and K_max across 64 tokens for channel 'd'
     float c_min = 1e20f, c_max = -1e20f;
     for (int t = 0; t < kPageTokens; ++t) {
         float val = hk[t * kHeadDim + d];
@@ -157,7 +159,7 @@ __global__ void pack_page_k4v2_and_bbox_kernel(
     page.k_ch_scale[d] = __float2half(scale);
     page.k_ch_min[d]   = __float2half(c_min);
 
-    // Passo B: Quantiza Key em 4 bits (pares de canais adjacentes combinados via warp shuffle)
+    // Step B: Quantize Key to 4 bits (adjacent channels packed via warp shuffle)
     float inv_scale = 1.0f / scale;
     for (int t = 0; t < kPageTokens; ++t) {
         float val = hk[t * kHeadDim + d];
@@ -170,7 +172,7 @@ __global__ void pack_page_k4v2_and_bbox_kernel(
         }
     }
 
-    // Passo C: Quantiza Value em 2 bits não-lineares (1 thread por token para t = 0..63)
+    // Step C: Quantize Value to 2 non-linear centroid bits (1 thread per token for t = 0..63)
     if (d < kPageTokens) {
         const int t = d;
         float sq_sum = 1e-8f;
@@ -196,12 +198,17 @@ __global__ void pack_page_k4v2_and_bbox_kernel(
     }
 }
 
-// Wrappers C++ para chamada externa
+// C++ launch wrappers for external invocation
 void launch_quest_score_pages(const float* d_q, const QuestPageBBox* d_bboxes, float* d_scores,
-                              int num_pages, int num_kv_heads, cudaStream_t stream) {
+                              int num_pages, int num_kv_heads, int num_graph_pinned_pages, cudaStream_t stream) {
     if (num_pages <= 0) return;
     quest_score_pages_kernel<<<num_pages, kHeadDim, 0, stream>>>(
-        d_q, d_bboxes, d_scores, num_pages, num_kv_heads);
+        d_q, d_bboxes, d_scores, num_pages, num_kv_heads, num_graph_pinned_pages);
+}
+
+void launch_quest_score_pages(const float* d_q, const QuestPageBBox* d_bboxes, float* d_scores,
+                              int num_pages, int num_kv_heads, cudaStream_t stream) {
+    launch_quest_score_pages(d_q, d_bboxes, d_scores, num_pages, num_kv_heads, 0, stream);
 }
 
 void launch_yarn_rope_256k(float* d_q_or_k, int num_heads, int token_pos,
@@ -217,6 +224,52 @@ void launch_pack_page_k4v2_and_bbox(const float* d_k, const float* d_v,
     if (num_heads <= 0) return;
     pack_page_k4v2_and_bbox_kernel<<<num_heads, kHeadDim, 0, stream>>>(
         d_k, d_v, d_page, d_bbox);
+}
+
+// Kernel to evaluate Late-RoPE dequantization in unit tests
+__global__ void dequant_late_rope_test_kernel(
+    const KVPageK4V2* __restrict__ pages,
+    int num_heads,
+    int token_in_page,
+    int slot_logical_base_pos,
+    float base_theta,
+    int orig_max_ctx,
+    float* __restrict__ out_k,
+    float* __restrict__ out_v
+) {
+    const int head_idx = blockIdx.x;
+    const int pair_idx = threadIdx.x; // 0..63
+    if (head_idx >= num_heads || pair_idx >= kHeadDim / 2) return;
+
+    float k0, k1, v0, v1;
+    dequant_k4v2_late_rope_pair(
+        pages[head_idx],
+        token_in_page,
+        pair_idx,
+        slot_logical_base_pos,
+        base_theta,
+        orig_max_ctx,
+        k0, k1, v0, v1
+    );
+
+    float* out_k_head = out_k + head_idx * kHeadDim;
+    float* out_v_head = out_v + head_idx * kHeadDim;
+
+    out_k_head[2 * pair_idx]     = k0;
+    out_k_head[2 * pair_idx + 1] = k1;
+    out_v_head[2 * pair_idx]     = v0;
+    out_v_head[2 * pair_idx + 1] = v1;
+}
+
+void launch_dequant_late_rope_test(
+    const KVPageK4V2* d_pages, int num_heads, int token_in_page,
+    int slot_logical_base_pos, float base_theta, int orig_max_ctx,
+    float* d_out_k, float* d_out_v, cudaStream_t stream
+) {
+    if (num_heads <= 0) return;
+    dequant_late_rope_test_kernel<<<num_heads, kHeadDim / 2, 0, stream>>>(
+        d_pages, num_heads, token_in_page, slot_logical_base_pos, base_theta, orig_max_ctx, d_out_k, d_out_v
+    );
 }
 
 } // namespace strata::kernels
