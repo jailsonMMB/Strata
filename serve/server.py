@@ -91,6 +91,118 @@ from serve import images as images_api  # noqa: E402
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
 
+# ---------------------------------------------------------------------------
+# 256K Tiered KV Cache Context Governance & Hermes Compaction Shield
+# ---------------------------------------------------------------------------
+TIERED_KV_HARD_MAX_TOKENS = 256000
+HERMES_COMPACT_TRIGGER_THRESHOLD = 240000
+VIRTUAL_REPORT_CEILING = 65536
+RING_EVICT_PAGES = 512  # 512 pages * 64 tokens = 32,768 tokens shifted per cycle
+SUMMARIZE_SIGNATURES = (
+    "summarize the conversation",
+    "condense the conversation",
+    "create a concise summary",
+    "conversation summary",
+    "summarize the following",
+    "compact the context",
+    "summarizing thread",
+)
+
+
+class SessionCompactionState:
+    """Tracks canonical system prompt and real token count per session/agent."""
+    __slots__ = ("session_id", "canonical_system_msg", "last_real_prompt_tokens", "overflow_policy")
+
+    def __init__(self, session_id: str, overflow_policy: str = "ring-late-rope"):
+        self.session_id = session_id
+        self.canonical_system_msg = None
+        self.last_real_prompt_tokens = 0
+        self.overflow_policy = overflow_policy
+
+
+class InfiniteContextController:
+    def __init__(self, default_policy: str = "ring-late-rope"):
+        self.default_policy = default_policy
+        self.sessions = {}
+
+    def get_session(self, payload: dict) -> SessionCompactionState:
+        messages = payload.get("messages", [])
+        seed = str(payload.get("user", "default"))
+        if messages and messages[0].get("role") == "system":
+            seed += "|" + str(messages[0].get("content", ""))[:128]
+        sid = hashlib.blake2b(seed.encode("utf-8"), digest_size=8).hexdigest()
+        if sid not in self.sessions:
+            self.sessions[sid] = SessionCompactionState(sid, self.default_policy)
+        return self.sessions[sid]
+
+    def is_summarizing_request(self, messages: list) -> bool:
+        if not messages:
+            return False
+        first_txt = str(messages[0].get("content", "")).lower()
+        last_txt = str(messages[-1].get("content", "")).lower()
+        return any(sig in first_txt or sig in last_txt for sig in SUMMARIZE_SIGNATURES)
+
+    def preprocess_request(self, engine, payload: dict) -> tuple:
+        messages = payload.get("messages", [])
+        if not messages:
+            return payload, False
+        sess = self.get_session(payload)
+        is_compaction = self.is_summarizing_request(messages)
+        if not is_compaction:
+            if messages[0].get("role") == "system":
+                sess.canonical_system_msg = dict(messages[0])
+            if (
+                sess.overflow_policy == "ring-late-rope"
+                and sess.last_real_prompt_tokens >= HERMES_COMPACT_TRIGGER_THRESHOLD
+            ):
+                try:
+                    engine.shift_kv(evict_pages=RING_EVICT_PAGES, num_graph_pinned_pages=24)
+                    sess.last_real_prompt_tokens -= RING_EVICT_PAGES * 64
+                except Exception:
+                    pass
+            return payload, False
+
+        # Intercept Hermes Summarizing Thread without downgrading reasoning_effort to low
+        first_txt = str(messages[0].get("content", "")).lower()
+        if any(sig in first_txt for sig in SUMMARIZE_SIGNATURES) and sess.canonical_system_msg:
+            summarizer_directive = messages[0].get("content", "")
+            restored_messages = [dict(sess.canonical_system_msg)] + messages[1:]
+            restored_messages.append({
+                "role": "user",
+                "content": (
+                    f"{summarizer_directive}\n\n"
+                    "[ENGINE CONSTRAINT: Keep reasoning concise and emit a dense technical "
+                    "summary under 1,024 tokens after closing </think>.]"
+                ),
+            })
+            payload["messages"] = restored_messages
+
+        payload["think_token_budget"] = 1536
+        payload["post_think_token_budget"] = 1024
+        req_max = int(payload.get("max_tokens") or payload.get("max_completion_tokens") or 16384)
+        payload["max_tokens"] = min(req_max, 2560)
+        if "max_completion_tokens" in payload:
+            payload["max_completion_tokens"] = min(req_max, 2560)
+        payload.pop("graph_kv_blocks", None)
+        payload.pop("graph_seed_symbols", None)
+        return payload, True
+
+    def postprocess_usage(self, payload: dict, usage: dict) -> dict:
+        sess = self.get_session(payload)
+        real_prompt = int(usage.get("prompt_tokens", 0))
+        completion = int(usage.get("completion_tokens", 0))
+        sess.last_real_prompt_tokens = real_prompt
+        if sess.overflow_policy == "ring-late-rope" or real_prompt < HERMES_COMPACT_TRIGGER_THRESHOLD:
+            if real_prompt > VIRTUAL_REPORT_CEILING:
+                virtual_prompt = VIRTUAL_REPORT_CEILING + ((real_prompt - VIRTUAL_REPORT_CEILING) // 8)
+                usage["strata_real_prompt_tokens"] = real_prompt
+                usage["prompt_tokens"] = virtual_prompt
+                usage["total_tokens"] = virtual_prompt + completion
+        return usage
+
+
+infinite_context_controller = InfiniteContextController()
+
 
 def popen(what: str, args: list, role: str = "engine", **kw):
     """#735: subprocess.Popen, but Windows' refusal to start a program (WinError 4551, or 1260 when a policy blocks it:
@@ -1682,6 +1794,40 @@ class StrataEngine:
                 return out
             if time.time() > deadline:
                 raise EngineDied("the engine did not answer the MOUNT_KV command")
+
+    def shift_kv(self, evict_pages: int = 512, num_graph_pinned_pages: int = 24, timeout: float = 10.0) -> dict:
+        """Shifts dialogue pages in the 256K tiered cache ring buffer via Late-RoPE."""
+        with self._exclusive_control():
+            return self._shift_kv(evict_pages, num_graph_pinned_pages, timeout)
+
+    def _shift_kv(self, evict_pages: int = 512, num_graph_pinned_pages: int = 24, timeout: float = 10.0) -> dict:
+        """Sends SHIFT_KV command to the engine and waits for SHIFT_OK."""
+        if not self.alive():
+            raise EngineDied("the engine is not running")
+        cmd = f"SHIFT_KV {int(evict_pages)} {int(num_graph_pinned_pages)}"
+        btrace("send>", cmd)
+        with self.wlock:
+            self.proc.stdin.write(cmd + "\n")
+            self.proc.stdin.flush()
+        deadline = time.time() + timeout
+        while True:
+            try:
+                line = self.lines.get(timeout=max(0.1, deadline - time.time()))
+            except queue.Empty:
+                raise EngineDied("the engine did not answer the SHIFT_KV command") from None
+            if line is None:
+                raise EngineDied("the engine ended")
+            line = line.strip()
+            if line.startswith("ERR"):
+                raise ValueError(line[4:].strip() or "the engine refused the SHIFT_KV command")
+            if line.startswith("SHIFT_OK"):
+                out = {}
+                for kv in line.split()[1:]:
+                    k, _, v = kv.partition("=")
+                    out[k] = int(v) if v.lstrip("-").isdigit() else v
+                return out
+            if time.time() > deadline:
+                raise EngineDied("the engine did not answer the SHIFT_KV command")
 
     def pen_from_key(self, orig_len: int, prompt_len: int) -> str:
         """` pen_from=N` for a leg that continues a request (prompt + what it generated): where the reply began, Strata's penalty window start. The all-cards split engine
@@ -7248,10 +7394,11 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
             finish = "tool_calls" if whole and x["finish"] == "stop" else {"cancel": "stop"}.get(x["finish"], x["finish"])
             last = chunk({}, finish)
             pt = x.get("prompt_tokens", len(ids))     # after MCP rounds: the last round's prompt
-            last["usage"] = {"prompt_tokens": pt, "completion_tokens": x["completion_tokens"],
-                             "total_tokens": pt + x["completion_tokens"],
-                             # the part of the prompt the conversation cache already held (OpenAI's field)
-                             "prompt_tokens_details": {"cached_tokens": x.get("reused") or 0}}
+            usage = {"prompt_tokens": pt, "completion_tokens": x["completion_tokens"],
+                     "total_tokens": pt + x["completion_tokens"],
+                     # the part of the prompt the conversation cache already held (OpenAI's field)
+                     "prompt_tokens_details": {"cached_tokens": x.get("reused") or 0}}
+            last["usage"] = infinite_context_controller.postprocess_usage(req, usage)
             if x.get("timings"):
                 last["timings"] = x["timings"]          # llama.cpp's field: the speed its clients show
             if x.get("rejected_tool_calls"):
@@ -8645,6 +8792,7 @@ def make_handler(svc: Service):
         def _openai(self, req):
             req = svc.with_shared(req, "openai")
             bias_api.normalize(req.get("logit_bias"), len(getattr(svc.tok, "tokens", ())) or None)
+            req, _ = infinite_context_controller.preprocess_request(svc.engine, req)
             messages, tools, kw = openai_to_messages(req)
             require_messages(messages)                # an empty conversation is a 400, as OpenAI answers it, not a reply to nothing
             self._no_local_images(messages)

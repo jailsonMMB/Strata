@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <numeric>
 #include <cstdio>
+#include <cstring>
 
 namespace strata::kernels {
 void launch_quest_score_pages(const float* d_q, const strata::core::QuestPageBBox* d_bboxes,
@@ -35,6 +36,7 @@ bool TieredKVCache256K::init() {
     d_active_logical_pos_.resize(num_layers_, nullptr);
     h_pinned_ddr4_pool_.resize(num_layers_, nullptr);
     h_active_page_tracker_.assign(num_layers_, std::vector<int32_t>(kVramActivePages, -1));
+    h_active_logical_pos_.assign(num_layers_, std::vector<int32_t>(kVramActivePages, -1));
 
     std::vector<int32_t> init_logical(kVramActivePages, -1);
     for (int l = 0; l < num_layers_; ++l) {
@@ -65,6 +67,7 @@ void TieredKVCache256K::commit_page_async(
 ) {
     if (page_idx < 0 || page_idx >= kMaxPages256K || layer < 0 || layer >= num_layers_) return;
     const size_t page_elems = num_kv_heads_;
+    num_allocated_pages_ = std::max(num_allocated_pages_, page_idx + 1);
 
     // 1. Update [K_min, K_max] summary in VRAM (12 MiB pool)
     cudaMemcpyAsync(d_quest_bboxes_[layer] + (size_t)page_idx * page_elems,
@@ -156,6 +159,7 @@ void TieredKVCache256K::mount_graph_pages_async(
         host_page_ids[p]    = ddr4_page_start + p;
         host_logical_pos[p] = assigned_logical_token_pos + p * kPageTokens;
         h_active_page_tracker_[layer][vram_slot_dst + p] = ddr4_page_start + p;
+        h_active_logical_pos_[layer][vram_slot_dst + p]  = assigned_logical_token_pos + p * kPageTokens;
     }
 
     cudaMemcpyAsync(
@@ -172,6 +176,70 @@ void TieredKVCache256K::mount_graph_pages_async(
         cudaMemcpyHostToDevice,
         dma_stream
     );
+}
+
+int TieredKVCache256K::evict_and_shift_late_rope(
+    int evict_pages,
+    int num_graph_pinned_pages,
+    cudaStream_t stream
+) {
+    const int first_dialogue_slot = kSinkPages + num_graph_pinned_pages;
+    if (evict_pages <= 0 || num_allocated_pages_ <= first_dialogue_slot + evict_pages) {
+        return 0;
+    }
+
+    const int evict_tokens = evict_pages * kPageTokens;
+    const int surviving_pages = num_allocated_pages_ - first_dialogue_slot - evict_pages;
+
+    for (int l = 0; l < num_layers_; ++l) {
+        // 1. Shift pinned DDR4 pool for all KV heads
+        KVPageK4V2* base_ddr4 = h_pinned_ddr4_pool_[l] + (size_t)first_dialogue_slot * num_kv_heads_;
+        std::memmove(
+            base_ddr4,
+            base_ddr4 + (size_t)evict_pages * num_kv_heads_,
+            static_cast<size_t>(surviving_pages) * num_kv_heads_ * sizeof(KVPageK4V2)
+        );
+
+        // 2. Shift Quest bounding boxes directly in VRAM across all KV heads
+        cudaMemcpyAsync(
+            d_quest_bboxes_[l] + (size_t)first_dialogue_slot * num_kv_heads_,
+            d_quest_bboxes_[l] + (size_t)(first_dialogue_slot + evict_pages) * num_kv_heads_,
+            static_cast<size_t>(surviving_pages) * num_kv_heads_ * sizeof(QuestPageBBox),
+            cudaMemcpyDeviceToDevice,
+            stream
+        );
+
+        // 3. Update host trackers and VRAM active slots (dialogue slots)
+        for (int s = first_dialogue_slot; s < kVramActivePages; ++s) {
+            if (h_active_logical_pos_[l][s] >= first_dialogue_slot * kPageTokens + evict_tokens) {
+                h_active_logical_pos_[l][s] -= evict_tokens;
+            }
+            int cur_page = h_active_page_tracker_[l][s];
+            if (cur_page >= first_dialogue_slot + evict_pages) {
+                h_active_page_tracker_[l][s] -= evict_pages;
+            } else if (cur_page >= first_dialogue_slot) {
+                h_active_page_tracker_[l][s] = -1; // Evicted page
+            }
+        }
+
+        cudaMemcpyAsync(
+            d_active_logical_pos_[l] + first_dialogue_slot,
+            h_active_logical_pos_[l].data() + first_dialogue_slot,
+            static_cast<size_t>(kVramActivePages - first_dialogue_slot) * sizeof(int32_t),
+            cudaMemcpyHostToDevice,
+            stream
+        );
+        cudaMemcpyAsync(
+            d_active_page_table_[l] + first_dialogue_slot,
+            h_active_page_tracker_[l].data() + first_dialogue_slot,
+            static_cast<size_t>(kVramActivePages - first_dialogue_slot) * sizeof(int32_t),
+            cudaMemcpyHostToDevice,
+            stream
+        );
+    }
+
+    num_allocated_pages_ -= evict_pages;
+    return evict_tokens;
 }
 
 } // namespace strata::core

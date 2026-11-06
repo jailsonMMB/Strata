@@ -58,14 +58,23 @@ public:
         cudaStream_t dma_stream
     );
 
+    // Recycles dialogue pages in a ring buffer, shifting DDR4 pools, Quest bboxes,
+    // and Late-RoPE logical token positions in O(1) time without recomputation.
+    int evict_and_shift_late_rope(int evict_pages, int num_graph_pinned_pages, cudaStream_t stream);
+
+    int num_allocated_pages() const { return num_allocated_pages_; }
+    void set_num_allocated_pages(int n) { num_allocated_pages_ = n; }
+
     const KVPageK4V2* vram_active_pool(int layer) const { return d_vram_pool_[layer]; }
     const int32_t* vram_active_page_ids(int layer) const { return d_active_page_table_[layer]; }
     const int32_t* vram_active_logical_pos(int layer) const { return d_active_logical_pos_[layer]; }
     const QuestPageBBox* quest_bboxes(int layer) const { return d_quest_bboxes_[layer]; }
+    const KVPageK4V2* host_ddr4_pool(int layer) const { return h_pinned_ddr4_pool_[layer]; }
 
 private:
     int num_layers_;
     int num_kv_heads_;
+    int num_allocated_pages_ = 0;
 
     // Tier 1 (VRAM): 64 active pages per layer (~350 MiB total)
     std::vector<KVPageK4V2*> d_vram_pool_;
@@ -75,6 +84,8 @@ private:
     std::vector<int32_t*> d_active_page_table_;
     // Initial logical token position assigned to each of the 64 active VRAM slots (Late-RoPE)
     std::vector<int32_t*> d_active_logical_pos_;
+    // Host-side mirror of active logical positions for O(1) updates
+    std::vector<std::vector<int32_t>> h_active_logical_pos_;
     // Host-side tracker of resident VRAM slot page IDs to prevent duplicate PCIe DMA transfers
     std::vector<std::vector<int32_t>> h_active_page_tracker_;
 

@@ -15282,10 +15282,12 @@ int main(int argc, char** argv) {
                 std::fflush(stdout);
                 continue;
             }
+#if defined(STRATA_HAS_TIERED_KV_256K)
+            static std::unique_ptr<strata::core::TieredKVCache256K> tiered_kv_256k;
+            static cudaStream_t dma_transfer_stream = nullptr;
+#endif
             if (line.rfind("MOUNT_KV ", 0) == 0) {
 #if defined(STRATA_HAS_TIERED_KV_256K)
-                static std::unique_ptr<strata::core::TieredKVCache256K> tiered_kv_256k;
-                static cudaStream_t dma_transfer_stream = nullptr;
                 if (!tiered_kv_256k) {
                     if (dma_transfer_stream == nullptr) {
                         cudaStreamCreateWithFlags(&dma_transfer_stream, cudaStreamNonBlocking);
@@ -15346,6 +15348,49 @@ int main(int argc, char** argv) {
                 continue;
 #else
                 std::printf("ERR MOUNT_KV: compiled without STRATA_HAS_TIERED_KV_256K\n");
+                std::fflush(stdout);
+                continue;
+#endif
+            }
+            if (line.rfind("SHIFT_KV ", 0) == 0) {
+#if defined(STRATA_HAS_TIERED_KV_256K)
+                const auto t0 = std::chrono::steady_clock::now();
+                if (!tiered_kv_256k) {
+                    if (dma_transfer_stream == nullptr) {
+                        cudaStreamCreateWithFlags(&dma_transfer_stream, cudaStreamNonBlocking);
+                    }
+                    tiered_kv_256k = std::make_unique<strata::core::TieredKVCache256K>((int) g.n_layers, (int) g.n_head_kv);
+                    if (!tiered_kv_256k->init()) {
+                        std::printf("ERR SHIFT_KV: failed to initialize TieredKVCache256K\n");
+                        std::fflush(stdout);
+                        continue;
+                    }
+                }
+
+                const char* p = line.c_str() + 9;
+                char* endp = nullptr;
+                int evict_pages = static_cast<int>(std::strtol(p, &endp, 10));
+                int pinned_pages = 24;
+                if (*endp != '\0') {
+                    pinned_pages = static_cast<int>(std::strtol(endp, &endp, 10));
+                }
+
+                int shifted_tokens = 0;
+                if (tiered_kv_256k != nullptr) {
+                    shifted_tokens = tiered_kv_256k->evict_and_shift_late_rope(
+                        evict_pages, pinned_pages, dma_transfer_stream
+                    );
+                    if (dma_transfer_stream != nullptr) {
+                        cudaStreamSynchronize(dma_transfer_stream);
+                    }
+                }
+                const auto t1 = std::chrono::steady_clock::now();
+                const auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+                std::printf("SHIFT_OK evicted_tokens=%d latency_us=%lld\n", shifted_tokens, (long long)us);
+                std::fflush(stdout);
+                continue;
+#else
+                std::printf("ERR SHIFT_KV: compiled without STRATA_HAS_TIERED_KV_256K\n");
                 std::fflush(stdout);
                 continue;
 #endif

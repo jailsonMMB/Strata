@@ -3107,6 +3107,11 @@ if(STRATA_IQ2XS_NVFP4 AND STRATA_ENABLE_CUDA AND NOT STRATA_HIP_GFX906 AND NOT S
       target_include_directories(graph_kv_registry_test PRIVATE include)
       target_link_libraries(graph_kv_registry_test PRIVATE strata_tiered_kv_256k CUDA::cudart)
       add_test(NAME graph_kv_registry_test COMMAND graph_kv_registry_test)
+
+      add_executable(tiered_kv_shift_test tests/core/tiered_kv_shift_test.cpp)
+      target_include_directories(tiered_kv_shift_test PRIVATE include)
+      target_link_libraries(tiered_kv_shift_test PRIVATE strata_tiered_kv_256k CUDA::cudart)
+      add_test(NAME tiered_kv_shift_test COMMAND tiered_kv_shift_test)
     endif()
 
     unset(_strata_fp4_gencode)
