@@ -12016,6 +12016,36 @@ int main(int argc, char** argv) {
             id.config = *config_fp;
             return true;
         };
+        // BARE-METAL SHM WARM BOOT
+        {
+            strata::core::SessionFileIdentity shm_id{};
+            std::string shm_err;
+            if (session_identity(shm_id, shm_err, nullptr)) {
+                const std::string shm_dir = "/dev/shm/strata_conv_cache/";
+                struct stat st{};
+                if (stat(shm_dir.c_str(), &st) != 0) mkdir(shm_dir.c_str(), 0777);
+                int restored = 0;
+                for (int slot = 0; slot < (int)o.conversation_cache_slots; ++slot) {
+                    const std::string path = shm_dir + "slot_" + std::to_string(slot) + ".bin";
+                    struct stat fstat{};
+                    if (stat(path.c_str(), &fstat) != 0) continue;
+                    strata::core::SavedConversation loaded;
+                    size_t bytes = 0;
+                    std::string read_err;
+                    strata::core::SessionReadLimits limits;
+                    strata::core::SessionStatus status{};
+                    bool ok = strata::core::session_file_read(path, shm_id, loaded, bytes, read_err, limits, &status);
+                    if (ok) {
+                        if (conversations.put(std::move(loaded))) ++restored;
+                    } else {
+                        std::fprintf(stderr, "[BARE-METAL SHM] slot %d invalid: %s\n", slot, read_err.c_str());
+                        std::remove(path.c_str());
+                    }
+                }
+                if (restored > 0)
+                    std::fprintf(stderr, "[BARE-METAL SHM] Warm boot: %d slot(s) restored from /dev/shm in RAM-speed.\n", restored);
+            }
+        }
         // What a park captures: the main session's conversation (park_current) or an idle batch slot's (park_slot:
         // the reply it decoded, before an admission overwrites it).  One budget / admission / snapshot path for both.
         struct ParkSource {
@@ -19866,6 +19896,28 @@ int main(int argc, char** argv) {
                 helper_blobs_before = blobs;
                 helper_bytes_before = bytes;
             }
+        }
+        // BARE-METAL SHM: persist parked conversations to /dev/shm before exit
+        {
+            const std::string shm_dir = "/dev/shm/strata_conv_cache/";
+            struct stat st{};
+            if (stat(shm_dir.c_str(), &st) != 0) mkdir(shm_dir.c_str(), 0777);
+            strata::core::SessionFileIdentity dump_id{};
+            dump_id.model = model_fp.value_or(0);
+            dump_id.config = config_fp.value_or(0);
+            size_t dumped = 0;
+            const auto active_convs = conversations.snapshot_entries();
+            for (size_t i = 0; i < active_convs.size(); ++i) {
+                const std::string path = shm_dir + "slot_" + std::to_string(i) + ".bin";
+                size_t bytes = 0;
+                std::string write_err;
+                if (strata::core::session_file_write(path, active_convs[i], dump_id, bytes, write_err))
+                    ++dumped;
+                else
+                    std::fprintf(stderr, "[BARE-METAL SHM] slot %zu write failed: %s\n", i, write_err.c_str());
+            }
+            if (dumped > 0)
+                std::fprintf(stderr, "[BARE-METAL SHM] Shutdown dump: %zu/%zu slots persisted to /dev/shm.\n", dumped, active_convs.size());
         }
         save_profile("exit");   // #477: QUIT, or the server closed stdin
 #if defined(STRATA_GPU_METAL)
