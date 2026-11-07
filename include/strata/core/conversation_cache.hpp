@@ -10,6 +10,8 @@
 #include <cstdint>
 #include <deque>
 #include <memory>
+#include <mutex>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -255,7 +257,26 @@ public:
     /// exactly the reuse it wanted.  0 parks every conversation, whatever its size.
     bool wants(int64_t tokens) const { return min_tokens_ <= 0 || tokens >= min_tokens_; }
     size_t bytes() const { return bytes_ + reuse_.bytes(); }
-    size_t size() const { return entries_.size(); }
+    size_t size() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return entries_.size();
+    }
+    // Thread-safe bare-metal SHM access: deep-copy snapshot of parked conversations.
+    std::vector<SavedConversation> snapshot_entries() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        std::vector<SavedConversation> copy;
+        copy.reserve(entries_.size());
+        for (const auto& e : entries_) copy.push_back(e);
+        return copy;
+    }
+    // Bare-metal SHM access: read-only view of a parked conversation by slot index.
+    // O(1) via std::deque; throws out_of_range on invalid index (defensive).
+    const SavedConversation& get_entry_at(size_t index) const {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (index >= entries_.size())
+            throw std::out_of_range("[BARE-METAL] slot index out of range in ConversationCache");
+        return entries_[index];
+    }
     size_t evictions() const { return evictions_; }
     // the longest parked conversation, in tokens (--kv-grow keeps the K/V that long while it could be restored)
     int64_t longest_tokens() const {
@@ -530,6 +551,7 @@ private:
         entries_.erase(entries_.begin() + (std::ptrdiff_t) index);
         serials_.erase(serials_.begin() + (std::ptrdiff_t) index);
     }
+    mutable std::mutex mu_;
     size_t budget_ = 0, slots_ = 0, bytes_ = 0, evictions_ = 0, superseded_ = 0, borrowed_ = 0;
     int64_t min_tokens_ = 0;   // --conversation-cache-min-tokens: 0 parks every conversation, whatever its size
     std::deque<SavedConversation> entries_; // least recently active first

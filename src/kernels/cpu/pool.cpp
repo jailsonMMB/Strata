@@ -15,6 +15,7 @@
 #include <intrin.h>   // __cpuidex, __rdtsc (STRATA_POOL_UMWAIT)
 #endif
 
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -57,6 +58,10 @@ static void lock_cpu_dma_latency() {
             } else {
                 ::close(fd);
             }
+        } else {
+            std::fprintf(stderr, "strata cpu pool: /dev/cpu_dma_latency open failed (%s). "
+                                 "To lock C-state wake latency without root, add user to audio group: "
+                                 "sudo usermod -aG audio $USER\n", std::strerror(errno));
         }
     }
 }
