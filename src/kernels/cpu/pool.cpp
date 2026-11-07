@@ -15,6 +15,7 @@
 #include <intrin.h>   // __cpuidex, __rdtsc (STRATA_POOL_UMWAIT)
 #endif
 
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -42,16 +43,25 @@
 #if defined(__linux__)
 static int s_cpu_dma_latency_fd = -1;
 static void lock_cpu_dma_latency() {
+    // Only lock CPU DMA latency if explicitly requested by user to prevent unnecessary power draw/heating
+    const char* env = std::getenv("STRATA_LOCK_DMA_LATENCY");
+    if (!env || (std::strcmp(env, "1") != 0 && std::strcmp(env, "true") != 0)) {
+        return;
+    }
     if (s_cpu_dma_latency_fd < 0) {
         int fd = ::open("/dev/cpu_dma_latency", O_RDWR | O_CLOEXEC);
         if (fd >= 0) {
             int32_t latency = 0;
             if (::write(fd, &latency, sizeof(latency)) == sizeof(latency)) {
                 s_cpu_dma_latency_fd = fd;
-                std::fprintf(stderr, "strata cpu pool: locked /dev/cpu_dma_latency to 0 (C-state wake latency < 1us)\n");
+                std::fprintf(stderr, "strata cpu pool: locked /dev/cpu_dma_latency to 0 (opt-in C-state wake latency < 1us)\n");
             } else {
                 ::close(fd);
             }
+        } else {
+            std::fprintf(stderr, "strata cpu pool: /dev/cpu_dma_latency open failed (%s). "
+                                 "To lock C-state wake latency without root, add user to audio group: "
+                                 "sudo usermod -aG audio $USER\n", std::strerror(errno));
         }
     }
 }

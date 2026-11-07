@@ -15,7 +15,7 @@ On heterogeneous MoE systems combining AMD Zen microarchitectures and NVIDIA Bla
 1. **Automatic Zen CCX Sharding Discovery via sysfs:** Automatically reads `/sys/devices/system/cpu/cpu*/cache/index3/id` and partitions odd/even MoE expert jobs into 3+3 thread slices across CCX0 and CCX1 with zero manual environment flags required.
 2. **20 MiB GPU L2 Cache Set-Aside & Access Policy Window:** Dynamically queries `cudaDevAttrMaxPersistingL2CacheSize` on Blackwell `sm_120` and sets aside the maximum persisting window (20 MiB on RTX 5060 Ti) using `cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize)`. Router and MTP draft streams maintain persisting retention, eliminating L2 eviction by expert reads.
 3. **Sub-Microsecond C-State Lock & FTZ/DAZ:**
-   - Locks `/dev/cpu_dma_latency` to `0`, reducing worker wakeup latency from ~25 µs to <1 µs.
+   - With opt-in `STRATA_LOCK_DMA_LATENCY=1`, locks `/dev/cpu_dma_latency` to `0`, reducing worker wakeup latency from ~25 µs to <1 µs without requiring root (requires user membership in `audio` group: `sudo usermod -aG audio $USER`).
    - Initialized `_MM_SET_FLUSH_ZERO_MODE` (FTZ) and `_MM_SET_DENORMALS_ZERO_MODE` (DAZ) across all worker and host pool threads.
    - Added `strata_stream_write_ps` with 32-byte cacheline auto-alignment, non-temporal `_mm256_stream_ps` stores, and `_mm_sfence()` memory barrier.
 4. **Unit Test Verification:** Added unit test `zen_topology_test`, passing 100%.
